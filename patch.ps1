@@ -344,6 +344,32 @@ function Find-ClaudeDir {
     return $null
 }
 
+function Find-ClaudeApp {
+	# Try at WindowsApps
+	$pkg = Find-ClaudeDir
+    if ($pkg) {
+		$AppDir = Join-Path $pkg "app"
+		if ($AppDir) { return $AppDir }
+	}
+	# Try at installed softwares
+	$uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    $pkg = Get-ItemProperty $uninstallKey -ErrorAction SilentlyContinue | 
+                 Where-Object { $_.DisplayName -match "Claude" -and $_.InstallLocation } | 
+                 Select-Object -First 1
+	if ($pkg) {
+		$activeVersion = $pkg.DisplayVersion
+		# Get the directory with current version .exe file
+		$claudeExe = Get-ChildItem -Path $pkg.InstallLocation -Filter "claude.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue | 
+					 Where-Object { 
+						(Test-Path (Join-Path $_.DirectoryName "resources\app.asar")) -and 
+						($_.VersionInfo.FileVersion -like "*$activeVersion*" -or $_.VersionInfo.ProductVersion -like "*$activeVersion*")
+					 } | Select-Object -First 1
+		if ($claudeExe) { return $claudeExe.DirectoryName }
+	}
+    return $null
+}
+
+
 function Stop-ClaudeServices {
     Write-Step "Halting Claude processes and services..."
     
@@ -520,11 +546,10 @@ function Install-Patch {
     Write-Host "     INSTALLING CLAUDE SMART RTL PATCH" -ForegroundColor Cyan
     Write-Host "=======================================================`n" -ForegroundColor Cyan
 
-    $ClaudeDir = Find-ClaudeDir
-    if (-not $ClaudeDir) { throw "Claude installation not found on this system." }
-    Write-Success "Found Claude at: $ClaudeDir"
-
-    $AppDir = Join-Path $ClaudeDir "app"
+	$AppDir = Find-ClaudeApp
+	if (-not $AppDir) { throw "Claude installation not found on this system." }
+    Write-Success "Found Claude app at: $AppDir"
+	
     $ResourcesDir = Join-Path $AppDir "resources"
     $AsarPath = Join-Path $ResourcesDir "app.asar"
     $ExePath = Join-Path $AppDir "claude.exe"
@@ -767,14 +792,12 @@ function Restore-Patch {
         Write-Step "Executing Fallback Rollback..."
     }
 
-    $ClaudeDir = Find-ClaudeDir
-    if (-not $ClaudeDir) { 
-        if ($IsRollback) { Write-Warn "Claude Dir not found during rollback." }
+    $AppDir = Find-ClaudeApp
+	if (-not $AppDir) { 
+        if ($IsRollback) { Write-Warn "Claude App Dir not found during rollback." }
         else { throw "Claude installation not found on this system." }
         return
     }
-    
-    $AppDir = Join-Path $ClaudeDir "app"
     $ResourcesDir = Join-Path $AppDir "resources"
     
     Stop-ClaudeServices
