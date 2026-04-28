@@ -35,17 +35,25 @@
 
 .PARAMETER Force
     Skip both confirmation prompts. All hash checks still run.
+    Does NOT skip the TOFU acknowledgment — use -AcceptTofu for that.
+
+.PARAMETER AcceptTofu
+    Explicitly acknowledge the Trust-On-First-Use trust model and skip the
+    TOFU warning prompt. Required when running non-interactively (e.g. CI).
+    By requiring an explicit flag, this makes the TOFU risk an opt-in choice
+    rather than something silently accepted by running the script.
 
 .PARAMETER ReleaseTag
     Download a specific release tag (e.g. "v1.2.0") instead of the latest.
 
 .EXAMPLE
-    .\update-local-patcher.ps1
-    .\update-local-patcher.ps1 -Force
-    .\update-local-patcher.ps1 -ReleaseTag v1.2.0
+    .\update-local-patcher.ps1 -AcceptTofu
+    .\update-local-patcher.ps1 -Force -AcceptTofu
+    .\update-local-patcher.ps1 -AcceptTofu -ReleaseTag v1.2.0
 #>
 param(
     [switch]$Force,
+    [switch]$AcceptTofu,
     [string]$ReleaseTag = ''
 )
 
@@ -69,6 +77,30 @@ Write-Host ""
 Write-Host "  Every file is verified against its SHA-256 hash from the" -ForegroundColor DarkGray
 Write-Host "  published release manifest before anything is written to disk." -ForegroundColor DarkGray
 Write-Host ""
+
+# ── TOFU acknowledgment gate ────────────────────────────────────────────────
+# This script uses Trust-On-First-Use (TOFU): it trusts whatever GitHub
+# publishes under the latest release tag over HTTPS. SHA-256 hashes guard
+# against transit corruption but NOT against a malicious release published by
+# whoever controls the GitHub repo. You must explicitly acknowledge this model
+# before the script proceeds — either via -AcceptTofu or an interactive prompt.
+if (-not $AcceptTofu) {
+    Write-Host "  TRUST MODEL: Trust-On-First-Use (TOFU)" -ForegroundColor Yellow
+    Write-Host "  --------------------------------------------------------" -ForegroundColor Yellow
+    Write-Host "  SHA-256 hashes verify integrity of files within a release." -ForegroundColor Yellow
+    Write-Host "  They do NOT protect against a malicious release published" -ForegroundColor Yellow
+    Write-Host "  by whoever controls the GitHub repository." -ForegroundColor Yellow
+    Write-Host "  To review source before trusting, visit:" -ForegroundColor Yellow
+    Write-Host "    https://github.com/$RepoOwner/$RepoName/releases" -ForegroundColor Cyan
+    Write-Host ""
+    $tofuAnswer = Read-Host "Type 'I understand TOFU' to continue, or press Enter to cancel"
+    if ($tofuAnswer -ne 'I understand TOFU') {
+        Write-Host "Update cancelled (TOFU not acknowledged)." -ForegroundColor Yellow
+        Write-Host "Re-run with -AcceptTofu to skip this prompt." -ForegroundColor DarkGray
+        exit 0
+    }
+    Write-Host ""
+}
 
 if (-not $Force) {
     $confirm = Read-Host "Download and verify the latest patcher release? (y/N)"

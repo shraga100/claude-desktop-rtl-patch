@@ -1161,9 +1161,12 @@ function Test-AsarIntegrity {
     $cachedTar = Get-AsarTarPath
 
     if (-not (Test-Path -LiteralPath $cachedTar)) {
-        # Check if the tarball was bundled in the release package next to patch.ps1.
-        # Release archives ship asar-3.2.10.tgz alongside the scripts so that the
-        # install flow is fully offline. Only fall back to network if the bundle is absent.
+        # Fail closed: look for the tarball next to patch.ps1 (release package) or in
+        # the state-dir cache. Do NOT fall back to a network download — patch.ps1 is
+        # fully offline by design. If the tarball is missing, the user must either:
+        #   a) Run from a release archive that ships asar-3.2.10.tgz alongside patch.ps1, or
+        #   b) Run update-local-patcher.ps1 to download a complete release package, or
+        #   c) Manually place asar-3.2.10.tgz next to patch.ps1.
         $bundledTar = $null
         if ($PSCommandPath) {
             $bundledTar = Join-Path (Split-Path -Parent $PSCommandPath) $global:RtlAsarTarFileName
@@ -1172,15 +1175,16 @@ function Test-AsarIntegrity {
             Write-Log "Using bundled ASAR tarball from release package: $bundledTar"
             Copy-Item -LiteralPath $bundledTar -Destination $cachedTar -Force
         } else {
-            Write-Log "Bundled tarball not found — downloading $global:RtlAsarPkg from npm registry..."
-            Write-Warn "Network access: downloading ASAR tool from $global:RtlAsarTarballUrl"
-            Write-Warn "To avoid this, ship $global:RtlAsarTarFileName alongside patch.ps1 in your release archive."
-            try {
-                Invoke-WebRequest -Uri $global:RtlAsarTarballUrl -OutFile $cachedTar -UseBasicParsing -ErrorAction Stop
-                Write-Log "Tarball downloaded: $cachedTar"
-            } catch {
-                throw "Failed to download ASAR tarball from $global:RtlAsarTarballUrl : $($_.Exception.Message)"
-            }
+            throw "ASAR tool tarball not found.`n" +
+                  "  Looked for bundled: $bundledTar`n" +
+                  "  Looked for cache  : $cachedTar`n" +
+                  "`n" +
+                  "patch.ps1 is offline-only and will not download tools automatically.`n" +
+                  "To fix, choose one of:`n" +
+                  "  1. Run from a release archive that includes $global:RtlAsarTarFileName`n" +
+                  "     (download from https://github.com/shraga100/claude-desktop-rtl-patch/releases)`n" +
+                  "  2. Run .\update-local-patcher.ps1 to fetch a verified release package.`n" +
+                  "  3. Manually copy $global:RtlAsarTarFileName next to patch.ps1."
         }
     } else {
         Write-Log "Using cached ASAR tarball: $(Split-Path $cachedTar -Leaf)"
@@ -1794,6 +1798,15 @@ function Install-Patch {
     if (Test-Path $ExePath)       { New-IntegrityBackup $ExePath       "$ExePath.bak" }
     if (Test-Path $CoworkSvcPath) { New-IntegrityBackup $CoworkSvcPath "$CoworkSvcPath.bak" }
 
+    # Collect SHA-256 of each .bak file for state.json (sidecars already written
+    # by New-IntegrityBackup; we just read them back so they land in state.json).
+    $script:BackupHashMap = @{}
+    foreach ($bakPath in @("$AsarPath.bak", "$ExePath.bak", "$CoworkSvcPath.bak")) {
+        if (Test-Path -LiteralPath $bakPath) {
+            $script:BackupHashMap[(Split-Path $bakPath -Leaf)] = Get-FileSha256Hex $bakPath
+        }
+    }
+
     # Always restore from backup before patching — ensures clean state
     # First run: .bak was just created from same file → copy is a no-op (safe)
     # Re-run: backup is validated by hash above → fresh install on clean files
@@ -1921,15 +1934,23 @@ function Install-Patch {
             Write-Log "Using local self-signed cert subject: $CertSubject"
 
             # 3. DYNAMIC CERTIFICATE GENERATION LOOP
-            # WHY LocalMachine\Root IS REQUIRED (not TrustedPublisher):
-            # Authenticode verification traces the signing cert's chain up to a
-            # trusted root CA. For a self-signed cert, the cert IS the root —
-            # it must therefore be in the Root store for Windows to call the chain
-            # "Valid". TrustedPublisher is an additional layer that controls UAC /
-            # SmartScreen prompts for already-trusted chains; it cannot substitute
-            # for a trusted root. Placing the cert only in TrustedPublisher produces
-            # a status of "UnknownError" from Get-AuthenticodeSignature because the
-            # chain has no trusted anchor. Root is the minimal necessary store.
+            # WHY LocalMachine\Root IS USED (not TrustedPublisher):
+            # [UNVERIFIED — no empirical test has been run against a real Claude
+            #  installation. The reasoning below is logical but NOT confirmed.]
+            #
+            # Working hypothesis: Authenticode verification traces the signing
+            # cert's chain up to a trusted root CA. For a self-signed cert, the
+            # cert IS the root — it may therefore need to be in the Root store for
+            # Windows to call the chain "Valid". TrustedPublisher controls UAC /
+            # SmartScreen prompts for already-trusted chains; it may not substitute
+            # for a trusted root CA. Placing the cert only in TrustedPublisher
+            # might produce "UnknownError" from Get-AuthenticodeSignature because
+            # the chain has no trusted anchor.
+            #
+            # If a future test on a real Claude install confirms that
+            # TrustedPublisher alone produces a "Valid" status, the StoreName
+            # below can be switched to "TrustedPublisher" to reduce the security
+            # footprint (Root is a higher-privilege store).
             #
             # Mitigations:
             #   * Subject is "CN=Claude-RTL-Patcher (self-signed), O=Local" — clearly
@@ -1939,8 +1960,7 @@ function Install-Patch {
             #     (step 8 below) — only the public cert remains in Root.
             Write-Warn "Installing self-signed code-signing certificate into LocalMachine\Root."
             Write-Warn "  Subject  : $CertSubject"
-            Write-Warn "  Root store is required: self-signed certs need to be their own CA"
-            Write-Warn "  for Authenticode chain validation (TrustedPublisher alone is not sufficient)."
+            Write-Warn "  Root store used (UNVERIFIED: TrustedPublisher may suffice — not tested)."
             Write-Warn "  Private key will be deleted immediately after signing."
             Write-Warn "  Use Restore (option 2) to remove this cert when reverting the patch."
             $ValidCertFound = $false
@@ -2091,7 +2111,9 @@ function Install-Patch {
 
         Write-Step "Cleanup & Launch"
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
-        Save-PatchState -InstallPath $ClaudeDir -CertThumbprint $script:LastCertThumbprint
+        $bkHashes = if ($script:BackupHashMap) { $script:BackupHashMap } else { @{} }
+        Save-PatchState -InstallPath $ClaudeDir -CertThumbprint $script:LastCertThumbprint `
+            -BackupHashes $bkHashes
         Start-ClaudeServices
 
         Write-Host "`n=======================================================" -ForegroundColor Green
