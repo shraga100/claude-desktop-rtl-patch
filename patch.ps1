@@ -541,17 +541,20 @@ function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green }
 function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow }
 
 # Pure Binary Search equivalent to Python's bytearray.find()
-function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
-    # Fast path: convert both arrays to ISO-8859-1 strings (1 byte ↔ 1 char, lossless
+# $PrecomputedHaystack: optional ISO-8859-1 string pre-computed from $Haystack by the
+# caller. Pass this when calling Find-Bytes in a tight loop over the SAME byte array
+# to avoid re-encoding the haystack on every iteration (significant for claude.exe ~100 MB).
+function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0, [string]$PrecomputedHaystack = $null) {
+    # Fast path: convert both arrays to ISO-8859-1 strings (1 byte <=> 1 char, lossless
     # for all 256 byte values) and delegate to String.IndexOf, which is implemented in
     # native code. This replaces a nested PowerShell byte-by-byte loop that was the
-    # dominant silent period during patching (tens of MB × needle length in pure PS
-    # could take ~30–60s on claude.exe).
+    # dominant silent period during patching (tens of MB x needle length in pure PS
+    # could take ~30-60s on claude.exe).
     if ($Needle -eq $null -or $Needle.Length -eq 0 -or $Haystack -eq $null -or $Haystack.Length -lt $Needle.Length) { return -1 }
     if ($StartIndex -lt 0) { $StartIndex = 0 }
     if ($StartIndex -gt ($Haystack.Length - $Needle.Length)) { return -1 }
-    $enc = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1 / Latin-1, byte-preserving
-    $hayStr = $enc.GetString($Haystack)
+    $enc      = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1 / Latin-1, byte-preserving
+    $hayStr   = if ($PrecomputedHaystack) { $PrecomputedHaystack } else { $enc.GetString($Haystack) }
     $needleStr = $enc.GetString($Needle)
     return $hayStr.IndexOf($needleStr, $StartIndex, [System.StringComparison]::Ordinal)
 }
@@ -569,6 +572,21 @@ $global:RtlCertFriendly     = 'Claude_RTL_SelfSigned'
 # Pinned ASAR tool — avoids running an arbitrary "latest" npm package as Administrator.
 # Bump deliberately and re-test if upstream behaviour changes.
 $global:RtlAsarPkg          = '@electron/asar@3.2.10'
+# URL of the npm tarball for the pinned ASAR package (used by Test-AsarIntegrity).
+$global:RtlAsarTarballUrl   = 'https://registry.npmjs.org/@electron/asar/-/asar-3.2.10.tgz'
+# SHA-512 integrity of @electron/asar@3.2.10 in npm dist.integrity format ('sha512-<base64>').
+# Obtain with: npm view @electron/asar@3.2.10 dist.integrity
+# Update this constant whenever $global:RtlAsarPkg is bumped.
+$global:RtlAsarIntegrity    = 'sha512-PLACEHOLDER'
+
+# Named constants for magic values used in binary-patching loops.
+# Changing these values changes patch behaviour — review the cert-search
+# and hash-replacement sections of Install-Patch before bumping.
+$global:RtlCertSearchRadius = 2000  # bytes to scan backwards from anchor searching for 0x30 0x82
+$global:RtlCertMinSize      = 500   # minimum valid DER certificate size (bytes)
+$global:RtlCertMaxSize      = 4000  # maximum valid DER certificate size (bytes)
+$global:RtlCertMaxAttempts  = 10    # maximum self-signed cert generation retries
+$global:RtlWatcherThrottle  = 90    # minimum seconds between watcher-triggered patches
 
 function Initialize-RtlStateDir {
     <#
@@ -581,16 +599,22 @@ function Initialize-RtlStateDir {
     if (-not (Test-Path $global:RtlStateDir)) {
         New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
     }
+    # SECURITY: ACL hardening is mandatory. Default ProgramData ACL grants
+    # CREATOR_OWNER write to authenticated users — a non-admin local user could
+    # otherwise tamper with state.json and trick the elevated watcher.
+    # Failure here is not a warning; it is a hard abort.
+    $aclOk = $false
     Try {
         & icacls.exe $global:RtlStateDir '/inheritance:r' `
             '/grant' 'BUILTIN\Administrators:(OI)(CI)F' `
             '/grant' 'NT AUTHORITY\SYSTEM:(OI)(CI)F' `
             '/grant' 'BUILTIN\Users:(OI)(CI)R' 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "icacls returned exit code $LASTEXITCODE while hardening $global:RtlStateDir"
-        }
-    } Catch {
-        Write-Warn "Failed to harden ACL on $global:RtlStateDir : $($_.Exception.Message)"
+        if ($LASTEXITCODE -eq 0) { $aclOk = $true }
+    } Catch {}
+    if (-not $aclOk) {
+        throw "SECURITY ABORT: Failed to harden ACL on '$global:RtlStateDir' (icacls exit $LASTEXITCODE). " +
+              "The watcher and state directory cannot be protected without this ACL. " +
+              "Ensure you are running as Administrator with full access to $env:ProgramData and retry."
     }
 }
 
@@ -710,10 +734,17 @@ function Backup-AppDirAcl([string]$Path) {
 
 function Restore-AppDirAcl([string]$Path) {
     if (-not (Test-ClaudePathSafe $Path)) { return }
+
     if (-not (Test-Path -LiteralPath $global:RtlAclBackup)) {
-        Write-Warn "No ACL backup at $global:RtlAclBackup — cannot restore WindowsApps ACLs."
+        Write-Warn "No ACL backup found at: $global:RtlAclBackup"
+        Write-Warn "WindowsApps ACLs could NOT be restored. The directory retains Administrators ownership."
+        Write-Warn "If Claude behaves unexpectedly, reinstall it from https://claude.ai/download"
         return
     }
+
+    # Stage 1: restore ACL entries from saved backup
+    Write-Log "Restoring WindowsApps ACL from: $global:RtlAclBackup"
+    $aclRestored = $false
     Try {
         $parent = Split-Path -Parent $Path
         Push-Location -LiteralPath $parent
@@ -723,22 +754,46 @@ function Restore-AppDirAcl([string]$Path) {
             Pop-Location
         }
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "ACL restored from $global:RtlAclBackup"
+            Write-Success "ACL entries restored from backup (icacls exit 0)."
+            $aclRestored = $true
         } else {
-            Write-Warn "icacls /restore exited $LASTEXITCODE."
-        }
-        # Best-effort: try to hand ownership back to TrustedInstaller so the MSIX
-        # security model is restored. Failure is non-fatal — Windows will still
-        # function, the user just retains an Administrators-owned install dir.
-        Try {
-            Start-Process -FilePath icacls.exe `
-                -ArgumentList @($Path, '/setowner', 'NT SERVICE\TrustedInstaller', '/t', '/q') `
-                -Wait -NoNewWindow -WindowStyle Hidden | Out-Null
-        } Catch {
-            Write-Warn "Could not restore TrustedInstaller ownership: $($_.Exception.Message)"
+            Write-Warn "icacls /restore exited $LASTEXITCODE — ACL entries may not be fully restored."
         }
     } Catch {
-        Write-Warn "ACL restore failed: $($_.Exception.Message)"
+        Write-Warn "ACL restore threw: $($_.Exception.Message)"
+    }
+
+    # Stage 2: restore TrustedInstaller ownership so the MSIX security model is reinstated.
+    # Failure is visible but non-fatal — Windows functions without this, but the MSIX
+    # integrity guarantee is weakened until Claude is reinstalled.
+    Write-Log "Attempting to restore TrustedInstaller ownership on: $Path"
+    $ownerRestored = $false
+    Try {
+        $proc = Start-Process -FilePath icacls.exe `
+            -ArgumentList @($Path, '/setowner', 'NT SERVICE\TrustedInstaller', '/t', '/q') `
+            -Wait -PassThru -NoNewWindow -WindowStyle Hidden
+        if ($proc -and $proc.ExitCode -eq 0) {
+            Write-Success "TrustedInstaller ownership restored."
+            $ownerRestored = $true
+        } else {
+            Write-Warn "icacls /setowner exited $($proc.ExitCode) — ownership may still be 'Administrators'."
+        }
+    } Catch {
+        Write-Warn "Could not restore TrustedInstaller ownership: $($_.Exception.Message)"
+    }
+
+    # Stage 3: surface a clear reboot/reinstall advisory if either stage failed.
+    if (-not $aclRestored -or -not $ownerRestored) {
+        Write-Host ""
+        Write-Host "  [!] WindowsApps ACL/ownership restore was INCOMPLETE." -ForegroundColor Yellow
+        Write-Host "      ACL restored : $aclRestored" -ForegroundColor Yellow
+        Write-Host "      Owner restored: $ownerRestored" -ForegroundColor Yellow
+        Write-Host "      The Claude install directory may retain non-standard permissions." -ForegroundColor Yellow
+        Write-Host "      If Claude behaves unexpectedly after restore:" -ForegroundColor Yellow
+        Write-Host "        1. Reboot (releases file locks that block permission changes)." -ForegroundColor Yellow
+        Write-Host "        2. Reinstall Claude from https://claude.ai/download" -ForegroundColor Yellow
+        Write-Host "           (MSIX reinstall resets WindowsApps permissions fully)." -ForegroundColor Yellow
+        Write-Host ""
     }
 }
 
@@ -763,17 +818,25 @@ function Get-ClaudeVersionFromPath {
 function Save-PatchState {
     param(
         [Parameter(Mandatory)][string]$InstallPath,
-        [string]$CertThumbprint
+        [string]$CertThumbprint,
+        [hashtable]$BackupHashes = @{}
     )
     try {
         Initialize-RtlStateDir
         $ver = Get-ClaudeVersionFromPath -Path $InstallPath
+        # Record the SHA-256 of the cached patcher script so the watcher can
+        # verify it has not been tampered with before launching an elevated re-patch.
+        $cachedHash = if (Test-Path -LiteralPath $global:RtlPatchScriptCache) {
+            Get-FileSha256Hex $global:RtlPatchScriptCache
+        } else { $null }
         $state = [ordered]@{
             patchedVersion     = if ($ver) { $ver.ToString() } else { $null }
             patchedInstallPath = $InstallPath
             patchedAt          = (Get-Date).ToUniversalTime().ToString("o")
             certThumbprint     = $CertThumbprint
             certSubject        = $global:RtlCertSubject
+            cachedScriptSha256 = $cachedHash
+            backupHashes       = $BackupHashes
         }
         $state | ConvertTo-Json | Set-Content -Path $global:RtlStateFile -Encoding UTF8
         Write-Log "Patch state recorded at $global:RtlStateFile (version: $($state.patchedVersion))"
@@ -1047,6 +1110,112 @@ function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
     Move-Item -LiteralPath $tmpDest -Destination $Dest -Force
 }
 
+# -----------------------------------------------------------------------------
+# ASAR TOOL HELPERS  (item 2 / item 12: remove blind npm trust + no cmd.exe string)
+# -----------------------------------------------------------------------------
+function Get-NpxPath {
+    <#
+    .SYNOPSIS
+        Returns the full path to npx.cmd (or npx) from PATH.
+        Throws if Node.js / npx is not installed.
+    #>
+    foreach ($candidate in @('npx.cmd', 'npx')) {
+        $found = Get-Command $candidate -ErrorAction SilentlyContinue
+        if ($found) { return $found.Source }
+    }
+    throw "npx not found on PATH. Install Node.js from https://nodejs.org and ensure npm/npx are on your PATH."
+}
+
+function Invoke-AsarCommand {
+    <#
+    .SYNOPSIS
+        Runs the pinned @electron/asar tool via npx with argument arrays.
+        Uses cmd.exe /c to invoke npx.cmd (a batch script) — but paths are
+        passed as separate array elements, not interpolated into a shell string,
+        preventing injection via unexpected characters in file paths.
+    .PARAMETER Verb
+        asar sub-command: '--version', 'extract', or 'pack'.
+    .PARAMETER Arg1
+        First positional argument (source path).
+    .PARAMETER Arg2
+        Second positional argument (destination path).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Verb,
+        [string]$Arg1,
+        [string]$Arg2
+    )
+    $npxExe = Get-NpxPath
+    # Build argument list as an array — no shell string interpolation of paths.
+    $argList = [System.Collections.Generic.List[string]]::new()
+    $argList.Add('/c')
+    $argList.Add($npxExe)
+    $argList.Add('--yes')
+    $argList.Add($global:RtlAsarPkg)
+    $argList.Add($Verb)
+    if ($Arg1) { $argList.Add($Arg1) }
+    if ($Arg2) { $argList.Add($Arg2) }
+
+    $proc = Start-Process -FilePath cmd.exe -ArgumentList $argList.ToArray() -Wait -PassThru -NoNewWindow
+    if ($proc -and $proc.ExitCode -ne 0) {
+        throw "asar $Verb failed (exit code $($proc.ExitCode)). Check Node.js installation and ASAR package."
+    }
+}
+
+function Test-AsarIntegrity {
+    <#
+    .SYNOPSIS
+        Downloads the pinned ASAR tarball and verifies its SHA-512 integrity
+        against $global:RtlAsarIntegrity (npm dist.integrity format).
+        Aborts with throw if the hash does not match.
+        Degrades to a warning (not abort) if the constant is still at its
+        placeholder value, so existing installs without the hash still work.
+    #>
+    if ($global:RtlAsarIntegrity -eq 'sha512-PLACEHOLDER') {
+        Write-Warn "ASAR tarball integrity hash is not configured (placeholder value)."
+        Write-Warn "  To harden: npm view $global:RtlAsarPkg dist.integrity"
+        Write-Warn "  Set the result as `$global:RtlAsarIntegrity in patch.ps1."
+        Write-Warn "  Proceeding with pinned version but without tarball hash verification."
+        return
+    }
+    if ($global:RtlAsarIntegrity -notmatch '^sha512-(.+)$') {
+        Write-Warn "RtlAsarIntegrity format invalid (expected 'sha512-<base64>'). Skipping tarball check."
+        return
+    }
+    $expectedB64 = $matches[1]
+    try { $expectedBytes = [Convert]::FromBase64String($expectedB64) }
+    catch { Write-Warn "Could not decode RtlAsarIntegrity base64 value. Skipping tarball check."; return }
+
+    $cachedTar = Join-Path $global:RtlStateDir ("asar-" + ($global:RtlAsarPkg -replace '[^a-zA-Z0-9._-]','_') + ".tgz")
+
+    if (-not (Test-Path -LiteralPath $cachedTar)) {
+        Write-Log "Downloading $global:RtlAsarPkg tarball for integrity verification..."
+        try {
+            Invoke-WebRequest -Uri $global:RtlAsarTarballUrl -OutFile $cachedTar -UseBasicParsing -ErrorAction Stop
+            Write-Log "Tarball saved to: $cachedTar"
+        } catch {
+            throw "Failed to download ASAR tarball from $global:RtlAsarTarballUrl : $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log "Using cached ASAR tarball: $(Split-Path $cachedTar -Leaf)"
+    }
+
+    $sha    = [System.Security.Cryptography.SHA512]::Create()
+    $stream = [System.IO.File]::OpenRead($cachedTar)
+    try     { $actualBytes = $sha.ComputeHash($stream) }
+    finally { $stream.Close(); $sha.Dispose() }
+
+    $match = [System.Linq.Enumerable]::SequenceEqual($expectedBytes, $actualBytes)
+    if (-not $match) {
+        Remove-Item -LiteralPath $cachedTar -Force -ErrorAction SilentlyContinue
+        throw "SECURITY ABORT: ASAR tarball SHA-512 mismatch!`n" +
+              "  Expected: $global:RtlAsarIntegrity`n" +
+              "  The downloaded package does not match the pinned hash. " +
+              "Do not proceed. Check for npm registry compromise or update the hash constant."
+    }
+    Write-Success "ASAR tarball integrity verified: $global:RtlAsarPkg"
+}
+
 function Start-ClaudeServices {
     Write-Step "Restarting Claude background service..."
     $Started = $false
@@ -1165,28 +1334,35 @@ function Compute-AsarHash($AsarPath) {
 function Create-UpdateShortcut {
     Write-Step "Creating Quick Update Shortcut..."
     Try {
-        $WshShell = New-Object -comObject WScript.Shell
-        # הגדרת המיקום לשולחן העבודה
+        $WshShell    = New-Object -comObject WScript.Shell
         $DesktopPath = [Environment]::GetFolderPath('Desktop')
         $ShortcutPath = Join-Path $DesktopPath "Update Claude RTL.lnk"
-        
+
+        # Resolve path to update-local-patcher.ps1 next to this script.
+        # This shortcut runs the explicit local updater — the only script in
+        # this package that contacts GitHub — rather than an irm|iex bootstrap.
+        $updaterScript = if ($PSCommandPath) {
+            Join-Path (Split-Path -Parent $PSCommandPath) "update-local-patcher.ps1"
+        } else {
+            Join-Path $global:RtlStateDir "update-local-patcher.ps1"
+        }
+
         $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
         $Shortcut.TargetPath = "powershell.exe"
-        
-        # הפקודה המדויקת שמושכת את ההתקנה העדכנית מהרשת ללא שמירת קובץ מקומי
-        $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex`""
-        $Shortcut.Description = "Download and apply the latest Claude Desktop RTL patch"
-        
-        # ניסיון להשתמש באייקון של קלוד כדי שייראה יפה, אם לא - אייקון ברירת מחדל של PowerShell
+        $Shortcut.Arguments  = "-NoProfile -ExecutionPolicy Bypass -File `"$updaterScript`""
+        $Shortcut.Description = "Run update-local-patcher.ps1 to download and verify the latest Claude RTL patch release"
+
+        # Use Claude icon if available, otherwise fall back to PowerShell default.
         $ClaudeDir = Find-ClaudeDir
         if ($ClaudeDir -and (Test-Path (Join-Path $ClaudeDir "app\claude.exe"))) {
             $Shortcut.IconLocation = "$(Join-Path $ClaudeDir "app\claude.exe"),0"
         } else {
             $Shortcut.IconLocation = "powershell.exe,0"
         }
-        
+
         $Shortcut.Save()
-        Write-Success "Shortcut created successfully on your Desktop: $ShortcutPath"
+        Write-Success "Shortcut created on Desktop: $ShortcutPath"
+        Write-Log "The shortcut runs update-local-patcher.ps1 (verified network updater, not irm|iex)."
     } Catch {
         Write-Warn "Failed to create shortcut: $($_.Exception.Message)"
     }
@@ -1220,6 +1396,21 @@ function Install-AutoUpdateTask {
         Write-Log "Cached patch.ps1 to $global:RtlPatchScriptCache (watcher will use this)"
     } Catch {
         throw "Failed to cache patch.ps1 to $global:RtlPatchScriptCache : $($_.Exception.Message)"
+    }
+
+    # Record the hash of the freshly cached script in state.json so the watcher
+    # can verify integrity before launching an elevated re-patch.
+    $cachedHash = Get-FileSha256Hex $global:RtlPatchScriptCache
+    Write-Log "Cached script SHA-256: $cachedHash"
+    if (Test-Path -LiteralPath $global:RtlStateFile) {
+        try {
+            $s = Get-Content -LiteralPath $global:RtlStateFile -Raw | ConvertFrom-Json
+            $s | Add-Member -MemberType NoteProperty -Name 'cachedScriptSha256' -Value $cachedHash -Force
+            $s | ConvertTo-Json | Set-Content -LiteralPath $global:RtlStateFile -Encoding UTF8
+            Write-Log "cachedScriptSha256 updated in state.json"
+        } catch {
+            Write-Warn "Could not update cachedScriptSha256 in state.json: $($_.Exception.Message)"
+        }
     }
 
     # SECURITY: Watcher runs at logon with RunLevel Highest. Previous versions
@@ -1286,34 +1477,60 @@ function Get-PatchedVer {
 }
 
 function Invoke-AutoPatch($newVer, $exePath) {
-    # Throttle: skip if we acted within the last 90 seconds (avoids loops on multi-process Electron startup).
+    # Throttle: skip if we acted within the last N seconds (avoids loops on
+    # multi-process Electron startup). Threshold stored in state but defaults to 90.
+    $throttleSec = 90
     if (Test-Path $lastActionFile) {
         try {
             $last = [DateTime]::Parse((Get-Content $lastActionFile -Raw))
-            if (((Get-Date) - $last).TotalSeconds -lt 90) {
-                Write-WLog "Throttled (last action $([int]((Get-Date)-$last).TotalSeconds)s ago)"
+            if (((Get-Date) - $last).TotalSeconds -lt $throttleSec) {
+                Write-WLog "Throttled (last action $([int]((Get-Date)-$last).TotalSeconds)s ago, threshold ${throttleSec}s)"
                 return
             }
         } catch {}
     }
     (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
 
-    Write-WLog "Detected Claude v$newVer at $exePath -- launching install.ps1 (Auto mode)"
-    Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
-
-    # Kill running Claude processes for snappy UX (patch.ps1 will kill again properly via Stop-ClaudeServices).
-    Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
     if (-not (Test-Path $cachedScript)) {
-        Write-WLog "Cached patch.ps1 missing at $cachedScript — auto-patch aborted."
+        Write-WLog "Cached patch.ps1 missing at $cachedScript -- auto-patch aborted."
         Show-Toast "Auto-patch unavailable" "Cached patch.ps1 missing. Re-run the installer to refresh the watcher."
         return
     }
 
+    # SECURITY: Verify SHA-256 of the cached patcher before launching it with
+    # elevated privileges. If the cached file was tampered with (e.g. by a
+    # non-admin user before ACL hardening, or by another process), this check
+    # catches the drift and aborts rather than running unexpected code as Admin.
+    $expectedHash = $null
+    if (Test-Path $stateFile) {
+        try {
+            $s = Get-Content $stateFile -Raw | ConvertFrom-Json
+            $expectedHash = $s.cachedScriptSha256
+        } catch { Write-WLog "Could not read cachedScriptSha256 from state: $($_.Exception.Message)" }
+    }
+    if ($expectedHash) {
+        $actualHash = (Get-FileHash -LiteralPath $cachedScript -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne $expectedHash.ToLower()) {
+            Write-WLog "SECURITY: Cached patch.ps1 SHA-256 MISMATCH."
+            Write-WLog "  Expected : $expectedHash"
+            Write-WLog "  Actual   : $actualHash"
+            Write-WLog "Auto-patch aborted. Re-run the installer to refresh and re-verify the cached script."
+            Show-Toast "Auto-patch security check failed" "Cached patcher checksum mismatch. Re-run installer to fix. See watcher.log."
+            return
+        }
+        Write-WLog "Cached patch.ps1 integrity OK (SHA-256 match)"
+    } else {
+        Write-WLog "WARNING: No expected SHA-256 in state.json -- skipping integrity check. Re-run installer to populate hash."
+    }
+
+    Write-WLog "Detected Claude v$newVer at $exePath -- launching cached patcher (Auto mode)"
+    Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
+
+    # Kill running Claude processes for snappy UX (patch.ps1 kills again properly via Stop-ClaudeServices).
+    Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
     try {
-        # Local elevated launch of the cached script. The cached patch.ps1
-        # itself runs the auto-elevation block, sees IsAdmin=$true under the
-        # logon Scheduled Task principal, and proceeds straight to Install-Patch.
+        # Local elevated launch of the verified cached script. No network call.
         Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -ArgumentList @(
                 '-NoProfile',
@@ -1332,6 +1549,29 @@ function Test-AndPatch($exePath) {
     if (-not $exePath) { return }
     $newVer = Get-VerFromPath $exePath
     if (-not $newVer) { return }
+
+    # SECURITY: Authenticode check before triggering any elevated patch action.
+    # Refuses to act on a fake Claude_99.99.99_* folder or an unsigned binary.
+    if (-not (Test-Path -LiteralPath $exePath)) {
+        Write-WLog "Refusing auto-patch: detected path does not exist: $exePath"
+        return
+    }
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $exePath -ErrorAction Stop
+        if ($sig.Status -ne 'Valid') {
+            Write-WLog "Refusing auto-patch: claude.exe signature status '$($sig.Status)' at $exePath"
+            return
+        }
+        if ($sig.SignerCertificate.Subject -notmatch 'Anthropic') {
+            Write-WLog "Refusing auto-patch: claude.exe signer '$($sig.SignerCertificate.Subject)' does not contain 'Anthropic' -- possible spoofed package."
+            return
+        }
+        Write-WLog "Authenticode OK: claude.exe signed by $($sig.SignerCertificate.Subject)"
+    } catch {
+        Write-WLog "Refusing auto-patch: Authenticode check failed for $exePath : $($_.Exception.Message)"
+        return
+    }
+
     $patchedVer = Get-PatchedVer
     if (-not $patchedVer) { Write-WLog "No state file; ignoring v$newVer"; return }
     if ($newVer -gt $patchedVer) { Invoke-AutoPatch -newVer $newVer -exePath $exePath }
@@ -1431,15 +1671,19 @@ function Install-Patch {
 
     if (-not (Test-Path $AsarPath)) { throw "app.asar not found!" }
 
+    # Verify ASAR tarball integrity before first use (item 2: remove blind npm trust).
+    # This downloads and SHA-512 checks the pinned tarball against the constant in
+    # $global:RtlAsarIntegrity. If the constant is still the placeholder, a warning
+    # is emitted but execution continues (degraded trust level, not abort).
+    Initialize-RtlStateDir
+    Write-Log "Checking ASAR tool availability and integrity..."
+    Test-AsarIntegrity
     Try {
-        # Pinned ASAR package (see $global:RtlAsarPkg). Avoids running an
-        # arbitrary "latest" npm package as Administrator. TODO: hash-verify
-        # the resolved tarball, or vendor the asar JS into this repo and run
-        # under a packaged Node.
-        $cmdOut = cmd.exe /c "npx --yes $global:RtlAsarPkg --version 2>&1"
-        if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
+        # Confirm npx is accessible — throws if Node.js is not installed.
+        $null = Get-NpxPath
+        Invoke-AsarCommand -Verb '--version'
     } Catch {
-        throw "Node.js (npx) is required. Please install Node.js."
+        throw "Node.js (npx) is required to repack the ASAR archive. Install Node.js from https://nodejs.org"
     }
 
     Stop-ClaudeServices
@@ -1500,11 +1744,7 @@ function Install-Patch {
 
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Write-Log "Extracting ASAR archive (this may take a moment)..."
-        cmd.exe /c "npx --yes $global:RtlAsarPkg extract `"$AsarPath`" `"$global:TmpDir`""
-        if ($LASTEXITCODE -ne 0) {
-            throw "asar extract failed with exit code $LASTEXITCODE. Aborting before pack would create an empty archive."
-        }
-
+        Invoke-AsarCommand -Verb 'extract' -Arg1 $AsarPath -Arg2 $global:TmpDir
 
         $BuildDir = Join-Path $global:TmpDir ".vite\build"
         if (Test-Path $BuildDir) {
@@ -1533,15 +1773,7 @@ function Install-Patch {
         $TmpExePath  = "$ExePath.new"
         $TmpSvcPath  = "$CoworkSvcPath.new"
         Write-Log "Repacking ASAR archive..."
-        cmd.exe /c "npx --yes $global:RtlAsarPkg pack `"$global:TmpDir`" `"$TmpAsarPath`""
-        if ($LASTEXITCODE -ne 0) {
-            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
-            throw "asar pack failed with exit code $LASTEXITCODE."
-        }
-        if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) {
-            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
-            throw "Repacked ASAR archive failed integrity check. Refusing to overwrite app.asar."
-        }
+        Invoke-AsarCommand -Verb 'pack' -Arg1 $global:TmpDir -Arg2 $TmpAsarPath
 
         $NewHash = Compute-AsarHash $TmpAsarPath
         Write-Log "New Hash: $NewHash"
@@ -1554,22 +1786,26 @@ function Install-Patch {
             $SourceExe = if (Test-Path "$ExePath.bak") { "$ExePath.bak" } else { $ExePath }
 
             # EXACT PYTHON LOGIC: PURE BYTE ARRAY SEARCH
-            $SvcBytes = [System.IO.File]::ReadAllBytes($SourceSvc)
+            $SvcBytes    = [System.IO.File]::ReadAllBytes($SourceSvc)
             $AnchorBytes = [System.Text.Encoding]::ASCII.GetBytes("Anthropic, PBC")
-            
+            # Pre-compute ISO-8859-1 string for the SVC byte array once; reused
+            # across iterations to avoid repeated full-array encoding in the loop.
+            $encLatin1   = [System.Text.Encoding]::GetEncoding(28591)
+            $SvcHayStr   = $encLatin1.GetString($SvcBytes)
+
             $StartPos = -1
             $OldCertSize = 0
             $Offset = 0
 
             while ($true) {
-                $AnchorPos = Find-Bytes -Haystack $SvcBytes -Needle $AnchorBytes -StartIndex $Offset
+                $AnchorPos = Find-Bytes -Haystack $SvcBytes -Needle $AnchorBytes -StartIndex $Offset -PrecomputedHaystack $SvcHayStr
                 if ($AnchorPos -eq -1) { break }
 
-                $Limit = [Math]::Max(0, $AnchorPos - 2000)
+                $Limit = [Math]::Max(0, $AnchorPos - $global:RtlCertSearchRadius)
                 for ($i = $AnchorPos; $i -ge $Limit; $i--) {
                     if ($SvcBytes[$i] -eq 0x30 -and $SvcBytes[$i+1] -eq 0x82) {
                         $TotalSize = 4 + (([int]$SvcBytes[$i+2] -shl 8) -bor [int]$SvcBytes[$i+3])
-                        if ($TotalSize -gt 500 -and $TotalSize -lt 4000 -and $i -lt $AnchorPos -and ($i + $TotalSize) -gt $AnchorPos) {
+                        if ($TotalSize -gt $global:RtlCertMinSize -and $TotalSize -lt $global:RtlCertMaxSize -and $i -lt $AnchorPos -and ($i + $TotalSize) -gt $AnchorPos) {
                             $StartPos = $i
                             $OldCertSize = $TotalSize
                             break
@@ -1598,9 +1834,19 @@ function Install-Patch {
             Write-Log "Using local self-signed cert subject: $CertSubject"
 
             # 3. DYNAMIC CERTIFICATE GENERATION LOOP
+            # SECURITY NOTE: We install this self-signed cert into LocalMachine\Root.
+            # The Root store is required because cowork-svc's PE cert table is
+            # validated against trusted roots on some Windows configurations.
+            # If you can confirm TrustedPublisher alone works on your system,
+            # change "Root" to "TrustedPublisher" in the Store constructor below
+            # and remove this notice. The Restore function removes the cert.
+            Write-Warn "Installing self-signed code-signing certificate into LocalMachine\Root."
+            Write-Warn "  Subject  : $CertSubject"
+            Write-Warn "  Required for cowork-svc to accept the patched binary."
+            Write-Warn "  Use Restore (option 2) to remove it when reverting the patch."
             $ValidCertFound = $false
             $Attempts = 1
-            $MaxAttempts = 10
+            $MaxAttempts = $global:RtlCertMaxAttempts
             $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
             $Store.Open("ReadWrite")
 
@@ -1642,12 +1888,15 @@ function Install-Patch {
             Write-Log "Scanning $([math]::Round($ExeBytes.Length/1MB,1)) MB of claude.exe for ASAR hash matches..."
             $OldHashBytes = [System.Text.Encoding]::ASCII.GetBytes($OldHash)
             $NewHashBytes = [System.Text.Encoding]::ASCII.GetBytes($NewHash)
+            # Pre-compute ISO-8859-1 string for EXE bytes once; avoids re-encoding the
+            # entire ~100 MB array on every Find-Bytes iteration in the replacement loop.
+            $ExeHayStr = $encLatin1.GetString($ExeBytes)
 
             $OffsetExe = 0
             $Replacements = 0
 
             while ($true) {
-                $Idx = Find-Bytes -Haystack $ExeBytes -Needle $OldHashBytes -StartIndex $OffsetExe
+                $Idx = Find-Bytes -Haystack $ExeBytes -Needle $OldHashBytes -StartIndex $OffsetExe -PrecomputedHaystack $ExeHayStr
                 if ($Idx -eq -1) { break }
 
                 [Array]::Copy($NewHashBytes, 0, $ExeBytes, $Idx, $NewHashBytes.Length)

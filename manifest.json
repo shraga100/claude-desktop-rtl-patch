@@ -1,0 +1,15 @@
+{
+  "_comment": "Release manifest for update-local-patcher.ps1. SHA-256 values must be recomputed at each release. Run New-Manifest.ps1 to regenerate.",
+  "version": "RELEASE_TAG",
+  "files": {
+    "patch.ps1": {
+      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
+    },
+    "install.ps1": {
+      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
+    },
+    "update-local-patcher.ps1": {
+      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
+    }
+  }
+}
