@@ -1,0 +1,49 @@
+# Patcher runtime artefacts (never commit)
+*.bak
+*.bak.sha256
+*.new
+*.original.md
+
+# Local state / logs that the patcher writes at runtime
+ClaudeRtlPatch/
+state.json
+watcher.log
+watcher.log.old
+last-action.txt
+appdir-acl.txt
+
+# PowerShell / Windows
+*.ps1.bak
+*.ps1~
+*.tmp
+*.log
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Node (used transiently by npx asar — should not appear, but guard anyway)
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# Build / extract scratch
+claude_rtl_patch_tmp/
+*.asar.extracted/
+
+# Secrets / certs (defence-in-depth — patcher does not write these to repo,
+# but accidental copies must not be committed)
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
