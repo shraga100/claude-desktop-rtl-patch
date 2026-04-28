@@ -8,12 +8,30 @@
 
     This script:
       1. Fetches the latest (or specified) release manifest from GitHub.
-      2. Downloads each listed file.
-      3. Verifies every file's SHA-256 against the manifest.
-      4. Asks for confirmation before replacing anything on disk.
+      2. Downloads each listed file from the same GitHub release.
+      3. Verifies every file's SHA-256 against the manifest before writing anything.
+      4. Asks for confirmation before replacing local files.
       5. Replaces local files ONLY after ALL verifications pass.
 
     If any hash check fails, the update is aborted and no local files are changed.
+
+    TRUST MODEL AND LIMITATIONS:
+    This script implements Trust-On-First-Use (TOFU) against GitHub Releases over
+    HTTPS. The manifest.json and the script files are downloaded from the same
+    release, so a compromised release would compromise both. Specifically:
+
+      * The SHA-256 hashes protect integrity within a single release (detect
+        partial downloads, CDN corruption, man-in-the-middle on the file body).
+      * They do NOT protect against a malicious actor who controls the GitHub
+        repo/release and publishes a backdoored release with matching hashes.
+      * This is acceptable for a community tool installed with explicit user intent,
+        but users who require supply-chain guarantees beyond TOFU should review the
+        source code on the tagged commit before running this updater.
+
+    A stronger alternative (not yet implemented):
+      * The maintainer signs the manifest with a GPG key whose public key is
+        embedded in this script, and this script verifies the GPG signature
+        before trusting any SHA-256 hash in the manifest.
 
 .PARAMETER Force
     Skip both confirmation prompts. All hash checks still run.

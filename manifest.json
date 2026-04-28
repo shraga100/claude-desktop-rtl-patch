@@ -1,15 +1,17 @@
-{
-  "_comment": "Release manifest for update-local-patcher.ps1. SHA-256 values must be recomputed at each release. Run New-Manifest.ps1 to regenerate.",
-  "version": "RELEASE_TAG",
-  "files": {
-    "patch.ps1": {
-      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
-    },
-    "install.ps1": {
-      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
-    },
-    "update-local-patcher.ps1": {
-      "sha256": "PLACEHOLDER_COMPUTE_WITH_New-Manifest.ps1"
-    }
-  }
+﻿{
+    "version":  "v2.0.0",
+    "files":  {
+                  "patch.ps1":  {
+                                    "sha256":  "571eca77a14b29052ed7219e81f2fd44b903b71e472559d0178fe49a20cac9da"
+                                },
+                  "install.ps1":  {
+                                      "sha256":  "e66e3df70002df6887ea62bfdc3e81add25287d874e303c9607c53535f500c83"
+                                  },
+                  "update-local-patcher.ps1":  {
+                                                   "sha256":  "71621ffd4438be3012e7d08f087b4a0950a231e67aac10c0e800f1e714c23ab4"
+                                               },
+                  "asar-3.2.10.tgz":  {
+                                          "sha256":  "8c3af8b089e3e80093d1f2169248d53b15e4e0ae140b34d0dc9d6d43ab3caf79"
+                                      }
+              }
 }

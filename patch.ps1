@@ -33,19 +33,19 @@ if (-not $IsAdmin) {
         Start-Process -FilePath PowerShell.exe -Verb RunAs `
             -ArgumentList "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`"$autoArg"
     } else {
-        # `irm | iex` path: no on-disk file to relaunch. Download to TEMP with
-        # UTF-8 BOM (required for PSv5.1 to parse Hebrew/box-drawing characters)
-        # and elevate that. This branch is only reachable when the bootstrap
-        # `install.ps1` flow is in use; users running a saved patch.ps1 always
-        # take the local-file branch above.
-        $TmpScript = Join-Path $env:TEMP "claude_rtl_patch.ps1"
-        $RepoUrl = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/patch.ps1"
-        Write-Host "Downloading script to temp file for elevation..." -ForegroundColor Cyan
-        Write-Host "  source: downloaded script ($RepoUrl)" -ForegroundColor DarkGray
-        $content = Invoke-RestMethod -Uri $RepoUrl
-        [System.IO.File]::WriteAllText($TmpScript, $content, [System.Text.UTF8Encoding]::new($true))
-        Start-Process -FilePath PowerShell.exe -Verb RunAs `
-            -ArgumentList "-NoProfile -NoExit -ExecutionPolicy Bypass -File `"$TmpScript`"$autoArg"
+        # $PSCommandPath is null — script was piped (irm|iex) rather than run from a file.
+        # This patcher no longer supports unattended remote-code-execution via irm|iex.
+        # All flows must originate from a saved local file so the user can audit what
+        # runs under elevated privileges.
+        Write-Host ""
+        Write-Host "ERROR: Cannot elevate — patch.ps1 must be run from a saved local file." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Download a release archive from:" -ForegroundColor Yellow
+        Write-Host "    https://github.com/shraga100/claude-desktop-rtl-patch/releases" -ForegroundColor Cyan
+        Write-Host "  Extract it, then run: .\install.ps1" -ForegroundColor Yellow
+        Write-Host "  Or run patch.ps1 directly from the extracted folder." -ForegroundColor Yellow
+        Write-Host ""
+        Exit 1
     }
     Exit
 }
@@ -572,12 +572,16 @@ $global:RtlCertFriendly     = 'Claude_RTL_SelfSigned'
 # Pinned ASAR tool — avoids running an arbitrary "latest" npm package as Administrator.
 # Bump deliberately and re-test if upstream behaviour changes.
 $global:RtlAsarPkg          = '@electron/asar@3.2.10'
-# URL of the npm tarball for the pinned ASAR package (used by Test-AsarIntegrity).
+# URL of the npm tarball for the pinned ASAR package (fallback when not bundled).
 $global:RtlAsarTarballUrl   = 'https://registry.npmjs.org/@electron/asar/-/asar-3.2.10.tgz'
+# Deterministic filename for the tarball; shipped in release archives and checked
+# by manifest.json so update-local-patcher.ps1 verifies it as part of every update.
+$global:RtlAsarTarFileName  = 'asar-3.2.10.tgz'
 # SHA-512 integrity of @electron/asar@3.2.10 in npm dist.integrity format ('sha512-<base64>').
-# Obtain with: npm view @electron/asar@3.2.10 dist.integrity
+# Verified against npm registry (npm view @electron/asar@3.2.10 dist.integrity) and
+# independently by downloading the tarball and computing SHA-512 locally.
 # Update this constant whenever $global:RtlAsarPkg is bumped.
-$global:RtlAsarIntegrity    = 'sha512-PLACEHOLDER'
+$global:RtlAsarIntegrity    = 'sha512-mvBSwIBUeiRscrCeJE1LwctAriBj65eUDm0Pc11iE5gRwzkmsdbS7FnZ1XUWjpSeQWL1L5g12Fc/SchPM9DUOw=='
 
 # Named constants for magic values used in binary-patching loops.
 # Changing these values changes patch behaviour — review the cert-search
@@ -1111,28 +1115,164 @@ function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
 }
 
 # -----------------------------------------------------------------------------
-# ASAR TOOL HELPERS  (item 2 / item 12: remove blind npm trust + no cmd.exe string)
+# ASAR TOOL HELPERS
+# Strategy: download the pinned tarball, verify SHA-512 (hard abort on mismatch),
+# extract with the Windows-builtin tar.exe, then invoke node.exe directly.
+# No cmd.exe, no shell string parsing, no npx, no network after first run.
 # -----------------------------------------------------------------------------
-function Get-NpxPath {
+function Get-NodePath {
+    <#
+    .SYNOPSIS Returns the full path to node.exe. Throws if not installed.
+    #>
+    $found = Get-Command 'node.exe' -ErrorAction SilentlyContinue
+    if (-not $found) { $found = Get-Command 'node' -ErrorAction SilentlyContinue }
+    if (-not $found) {
+        throw "node.exe not found on PATH. Install Node.js from https://nodejs.org and retry."
+    }
+    return $found.Source
+}
+
+function Get-AsarTarPath {
+    # Cache path for the verified ASAR tarball inside the hardened state dir.
+    return Join-Path $global:RtlStateDir $global:RtlAsarTarFileName
+}
+
+function Get-AsarVendorDir {
+    return Join-Path $global:RtlStateDir "asar-vendor"
+}
+
+function Test-AsarIntegrity {
     <#
     .SYNOPSIS
-        Returns the full path to npx.cmd (or npx) from PATH.
-        Throws if Node.js / npx is not installed.
+        Downloads the pinned ASAR tarball and verifies its SHA-512 integrity
+        against $global:RtlAsarIntegrity (npm dist.integrity 'sha512-<base64>' format).
+        Hard-aborts if the hash does not match — no degraded/warn-only mode.
+        Safe to call multiple times: skips download if a matching cache exists.
     #>
-    foreach ($candidate in @('npx.cmd', 'npx')) {
-        $found = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($found) { return $found.Source }
+    if ($global:RtlAsarIntegrity -notmatch '^sha512-(.+)$') {
+        throw "SECURITY ABORT: RtlAsarIntegrity constant is missing or malformed. " +
+              "Expected 'sha512-<base64>' (run: npm view $global:RtlAsarPkg dist.integrity). " +
+              "Cannot proceed without a known-good hash for the ASAR tool."
     }
-    throw "npx not found on PATH. Install Node.js from https://nodejs.org and ensure npm/npx are on your PATH."
+    $expectedB64 = $matches[1]
+    try { $expectedBytes = [Convert]::FromBase64String($expectedB64) }
+    catch { throw "Could not decode RtlAsarIntegrity base64: $($_.Exception.Message)" }
+
+    $cachedTar = Get-AsarTarPath
+
+    if (-not (Test-Path -LiteralPath $cachedTar)) {
+        # Check if the tarball was bundled in the release package next to patch.ps1.
+        # Release archives ship asar-3.2.10.tgz alongside the scripts so that the
+        # install flow is fully offline. Only fall back to network if the bundle is absent.
+        $bundledTar = $null
+        if ($PSCommandPath) {
+            $bundledTar = Join-Path (Split-Path -Parent $PSCommandPath) $global:RtlAsarTarFileName
+        }
+        if ($bundledTar -and (Test-Path -LiteralPath $bundledTar)) {
+            Write-Log "Using bundled ASAR tarball from release package: $bundledTar"
+            Copy-Item -LiteralPath $bundledTar -Destination $cachedTar -Force
+        } else {
+            Write-Log "Bundled tarball not found — downloading $global:RtlAsarPkg from npm registry..."
+            Write-Warn "Network access: downloading ASAR tool from $global:RtlAsarTarballUrl"
+            Write-Warn "To avoid this, ship $global:RtlAsarTarFileName alongside patch.ps1 in your release archive."
+            try {
+                Invoke-WebRequest -Uri $global:RtlAsarTarballUrl -OutFile $cachedTar -UseBasicParsing -ErrorAction Stop
+                Write-Log "Tarball downloaded: $cachedTar"
+            } catch {
+                throw "Failed to download ASAR tarball from $global:RtlAsarTarballUrl : $($_.Exception.Message)"
+            }
+        }
+    } else {
+        Write-Log "Using cached ASAR tarball: $(Split-Path $cachedTar -Leaf)"
+    }
+
+    $sha    = [System.Security.Cryptography.SHA512]::Create()
+    $stream = [System.IO.File]::OpenRead($cachedTar)
+    try     { $actualBytes = $sha.ComputeHash($stream) }
+    finally { $stream.Close(); $sha.Dispose() }
+
+    if (-not [System.Linq.Enumerable]::SequenceEqual($expectedBytes, $actualBytes)) {
+        Remove-Item -LiteralPath $cachedTar -Force -ErrorAction SilentlyContinue
+        throw "SECURITY ABORT: ASAR tarball SHA-512 mismatch!`n" +
+              "  Expected : $global:RtlAsarIntegrity`n" +
+              "  The downloaded package does not match the pinned hash. " +
+              "Possible npm registry tamper or CDN corruption. Aborting."
+    }
+    Write-Success "ASAR tarball SHA-512 verified: $global:RtlAsarPkg"
+}
+
+function Install-AsarVendor {
+    <#
+    .SYNOPSIS
+        Extracts the verified ASAR tarball into $RtlStateDir\asar-vendor using
+        the Windows-builtin tar.exe (available since Windows 10 v1803).
+        Idempotent: skips extraction if asar.js is already present.
+    #>
+    $vendorDir = Get-AsarVendorDir
+    $asarJs    = Join-Path $vendorDir "package\bin\asar.js"
+
+    if (Test-Path -LiteralPath $asarJs) {
+        Write-Log "ASAR vendor already extracted: $asarJs"
+        return
+    }
+
+    $cachedTar = Get-AsarTarPath
+    if (-not (Test-Path -LiteralPath $cachedTar)) {
+        throw "ASAR tarball not found at $cachedTar. Call Test-AsarIntegrity first."
+    }
+
+    $tarExe = "$env:SystemRoot\System32\tar.exe"
+    if (-not (Test-Path -LiteralPath $tarExe)) {
+        throw "tar.exe not found at $tarExe. Windows 10 v1803+ is required."
+    }
+
+    if (Test-Path -LiteralPath $vendorDir) { Remove-Item -LiteralPath $vendorDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $vendorDir -Force | Out-Null
+
+    Write-Log "Extracting ASAR vendor package with tar.exe..."
+    $proc = Start-Process -FilePath $tarExe `
+        -ArgumentList @('-xzf', $cachedTar, '-C', $vendorDir) `
+        -Wait -PassThru -NoNewWindow
+    if ($proc -and $proc.ExitCode -ne 0) {
+        throw "tar.exe extraction failed (exit $($proc.ExitCode)). Tarball may be corrupt."
+    }
+
+    if (-not (Test-Path -LiteralPath $asarJs)) {
+        throw "asar.js not found at expected path $asarJs after extraction."
+    }
+    Write-Success "ASAR vendor extracted: $vendorDir"
+}
+
+function Get-AsarJsPath {
+    <#
+    .SYNOPSIS
+        Returns the path to the asar CLI entry point from the vendored package.
+        Reads bin entry from package.json for forward compatibility.
+    #>
+    $vendorDir = Get-AsarVendorDir
+    $pkgJson   = Join-Path $vendorDir "package\package.json"
+    if (-not (Test-Path -LiteralPath $pkgJson)) {
+        throw "Vendored asar package.json not found at $pkgJson. Run Test-AsarIntegrity and Install-AsarVendor."
+    }
+    $pkg = Get-Content -LiteralPath $pkgJson -Raw | ConvertFrom-Json
+    $binEntry = if ($pkg.bin -is [string]) { $pkg.bin }
+                elseif ($pkg.bin.asar)     { $pkg.bin.asar }
+                else { $null }
+    if (-not $binEntry) { throw "Cannot determine asar bin entry from $pkgJson" }
+
+    $normEntry = $binEntry -replace '/', '\'
+    $fullPath  = Join-Path $vendorDir "package\$normEntry"
+    if (-not (Test-Path -LiteralPath $fullPath)) {
+        throw "asar CLI entry point not found at $fullPath"
+    }
+    return $fullPath
 }
 
 function Invoke-AsarCommand {
     <#
     .SYNOPSIS
-        Runs the pinned @electron/asar tool via npx with argument arrays.
-        Uses cmd.exe /c to invoke npx.cmd (a batch script) — but paths are
-        passed as separate array elements, not interpolated into a shell string,
-        preventing injection via unexpected characters in file paths.
+        Invokes the vendored asar CLI via node.exe directly.
+        No cmd.exe, no shell string parsing, no network after first setup.
     .PARAMETER Verb
         asar sub-command: '--version', 'extract', or 'pack'.
     .PARAMETER Arg1
@@ -1145,75 +1285,20 @@ function Invoke-AsarCommand {
         [string]$Arg1,
         [string]$Arg2
     )
-    $npxExe = Get-NpxPath
-    # Build argument list as an array — no shell string interpolation of paths.
+    $nodeExe = Get-NodePath
+    $asarJs  = Get-AsarJsPath
+
+    # Argument array — no shell interpolation, no injection surface.
     $argList = [System.Collections.Generic.List[string]]::new()
-    $argList.Add('/c')
-    $argList.Add($npxExe)
-    $argList.Add('--yes')
-    $argList.Add($global:RtlAsarPkg)
+    $argList.Add($asarJs)
     $argList.Add($Verb)
     if ($Arg1) { $argList.Add($Arg1) }
     if ($Arg2) { $argList.Add($Arg2) }
 
-    $proc = Start-Process -FilePath cmd.exe -ArgumentList $argList.ToArray() -Wait -PassThru -NoNewWindow
+    $proc = Start-Process -FilePath $nodeExe -ArgumentList $argList.ToArray() -Wait -PassThru -NoNewWindow
     if ($proc -and $proc.ExitCode -ne 0) {
-        throw "asar $Verb failed (exit code $($proc.ExitCode)). Check Node.js installation and ASAR package."
+        throw "asar $Verb failed (node exit code $($proc.ExitCode)). Check node.exe and ASAR vendor installation."
     }
-}
-
-function Test-AsarIntegrity {
-    <#
-    .SYNOPSIS
-        Downloads the pinned ASAR tarball and verifies its SHA-512 integrity
-        against $global:RtlAsarIntegrity (npm dist.integrity format).
-        Aborts with throw if the hash does not match.
-        Degrades to a warning (not abort) if the constant is still at its
-        placeholder value, so existing installs without the hash still work.
-    #>
-    if ($global:RtlAsarIntegrity -eq 'sha512-PLACEHOLDER') {
-        Write-Warn "ASAR tarball integrity hash is not configured (placeholder value)."
-        Write-Warn "  To harden: npm view $global:RtlAsarPkg dist.integrity"
-        Write-Warn "  Set the result as `$global:RtlAsarIntegrity in patch.ps1."
-        Write-Warn "  Proceeding with pinned version but without tarball hash verification."
-        return
-    }
-    if ($global:RtlAsarIntegrity -notmatch '^sha512-(.+)$') {
-        Write-Warn "RtlAsarIntegrity format invalid (expected 'sha512-<base64>'). Skipping tarball check."
-        return
-    }
-    $expectedB64 = $matches[1]
-    try { $expectedBytes = [Convert]::FromBase64String($expectedB64) }
-    catch { Write-Warn "Could not decode RtlAsarIntegrity base64 value. Skipping tarball check."; return }
-
-    $cachedTar = Join-Path $global:RtlStateDir ("asar-" + ($global:RtlAsarPkg -replace '[^a-zA-Z0-9._-]','_') + ".tgz")
-
-    if (-not (Test-Path -LiteralPath $cachedTar)) {
-        Write-Log "Downloading $global:RtlAsarPkg tarball for integrity verification..."
-        try {
-            Invoke-WebRequest -Uri $global:RtlAsarTarballUrl -OutFile $cachedTar -UseBasicParsing -ErrorAction Stop
-            Write-Log "Tarball saved to: $cachedTar"
-        } catch {
-            throw "Failed to download ASAR tarball from $global:RtlAsarTarballUrl : $($_.Exception.Message)"
-        }
-    } else {
-        Write-Log "Using cached ASAR tarball: $(Split-Path $cachedTar -Leaf)"
-    }
-
-    $sha    = [System.Security.Cryptography.SHA512]::Create()
-    $stream = [System.IO.File]::OpenRead($cachedTar)
-    try     { $actualBytes = $sha.ComputeHash($stream) }
-    finally { $stream.Close(); $sha.Dispose() }
-
-    $match = [System.Linq.Enumerable]::SequenceEqual($expectedBytes, $actualBytes)
-    if (-not $match) {
-        Remove-Item -LiteralPath $cachedTar -Force -ErrorAction SilentlyContinue
-        throw "SECURITY ABORT: ASAR tarball SHA-512 mismatch!`n" +
-              "  Expected: $global:RtlAsarIntegrity`n" +
-              "  The downloaded package does not match the pinned hash. " +
-              "Do not proceed. Check for npm registry compromise or update the hash constant."
-    }
-    Write-Success "ASAR tarball integrity verified: $global:RtlAsarPkg"
 }
 
 function Start-ClaudeServices {
@@ -1671,19 +1756,21 @@ function Install-Patch {
 
     if (-not (Test-Path $AsarPath)) { throw "app.asar not found!" }
 
-    # Verify ASAR tarball integrity before first use (item 2: remove blind npm trust).
-    # This downloads and SHA-512 checks the pinned tarball against the constant in
-    # $global:RtlAsarIntegrity. If the constant is still the placeholder, a warning
-    # is emitted but execution continues (degraded trust level, not abort).
+    # Verify ASAR tool integrity before first use.
+    # Downloads the pinned tarball (if not already cached), verifies SHA-512 —
+    # hard abort on mismatch. Extracts into the hardened state dir with tar.exe.
+    # From this point forward, node.exe calls the vendored asar.js directly —
+    # no npx, no cmd.exe, no network after the first run.
     Initialize-RtlStateDir
-    Write-Log "Checking ASAR tool availability and integrity..."
+    Write-Log "Verifying and setting up ASAR vendor tool..."
     Test-AsarIntegrity
+    Install-AsarVendor
     Try {
-        # Confirm npx is accessible — throws if Node.js is not installed.
-        $null = Get-NpxPath
+        # Smoke-test: confirm node.exe can run the vendored asar binary.
+        $null = Get-NodePath
         Invoke-AsarCommand -Verb '--version'
     } Catch {
-        throw "Node.js (npx) is required to repack the ASAR archive. Install Node.js from https://nodejs.org"
+        throw "ASAR tool smoke-test failed: $($_.Exception.Message). Install Node.js from https://nodejs.org"
     }
 
     Stop-ClaudeServices
@@ -1834,16 +1921,28 @@ function Install-Patch {
             Write-Log "Using local self-signed cert subject: $CertSubject"
 
             # 3. DYNAMIC CERTIFICATE GENERATION LOOP
-            # SECURITY NOTE: We install this self-signed cert into LocalMachine\Root.
-            # The Root store is required because cowork-svc's PE cert table is
-            # validated against trusted roots on some Windows configurations.
-            # If you can confirm TrustedPublisher alone works on your system,
-            # change "Root" to "TrustedPublisher" in the Store constructor below
-            # and remove this notice. The Restore function removes the cert.
+            # WHY LocalMachine\Root IS REQUIRED (not TrustedPublisher):
+            # Authenticode verification traces the signing cert's chain up to a
+            # trusted root CA. For a self-signed cert, the cert IS the root —
+            # it must therefore be in the Root store for Windows to call the chain
+            # "Valid". TrustedPublisher is an additional layer that controls UAC /
+            # SmartScreen prompts for already-trusted chains; it cannot substitute
+            # for a trusted root. Placing the cert only in TrustedPublisher produces
+            # a status of "UnknownError" from Get-AuthenticodeSignature because the
+            # chain has no trusted anchor. Root is the minimal necessary store.
+            #
+            # Mitigations:
+            #   * Subject is "CN=Claude-RTL-Patcher (self-signed), O=Local" — clearly
+            #     local, never impersonates Anthropic.
+            #   * Thumbprint is stored in state.json; Restore removes it precisely.
+            #   * The private key is deleted from My store immediately after signing
+            #     (step 8 below) — only the public cert remains in Root.
             Write-Warn "Installing self-signed code-signing certificate into LocalMachine\Root."
             Write-Warn "  Subject  : $CertSubject"
-            Write-Warn "  Required for cowork-svc to accept the patched binary."
-            Write-Warn "  Use Restore (option 2) to remove it when reverting the patch."
+            Write-Warn "  Root store is required: self-signed certs need to be their own CA"
+            Write-Warn "  for Authenticode chain validation (TrustedPublisher alone is not sufficient)."
+            Write-Warn "  Private key will be deleted immediately after signing."
+            Write-Warn "  Use Restore (option 2) to remove this cert when reverting the patch."
             $ValidCertFound = $false
             $Attempts = 1
             $MaxAttempts = $global:RtlCertMaxAttempts

@@ -11,7 +11,10 @@ param(
 )
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$Files = @('patch.ps1', 'install.ps1', 'update-local-patcher.ps1')
+# Include the vendored ASAR tarball in the manifest so update-local-patcher.ps1
+# verifies it as part of every release update. The tarball is shipped in the
+# release archive; manifest hash prevents CDN/transit corruption.
+$Files = @('patch.ps1', 'install.ps1', 'update-local-patcher.ps1', 'asar-3.2.10.tgz')
 
 $fileEntries = [ordered]@{}
 foreach ($f in $Files) {
