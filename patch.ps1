@@ -827,6 +827,7 @@ function Save-PatchState {
     )
     try {
         Initialize-RtlStateDir
+        Initialize-RtlStateDir
         $ver = Get-ClaudeVersionFromPath -Path $InstallPath
         # Record the SHA-256 of the cached patcher script so the watcher can
         # verify it has not been tampered with before launching an elevated re-patch.
@@ -857,7 +858,32 @@ function Get-PatchStateField([string]$Name) {
     } catch { return $null }
 }
 
+function Get-PatchStateField([string]$Name) {
+    if (-not (Test-Path -LiteralPath $global:RtlStateFile)) { return $null }
+    try {
+        $s = Get-Content -LiteralPath $global:RtlStateFile -Raw | ConvertFrom-Json
+        return $s.$Name
+    } catch { return $null }
+}
+
 function Find-ClaudeDir {
+    # Strict filter: AnthropicPBC* package name OR publisher cert subject contains
+    # "CN=Anthropic". Refuses to silently pick a sideloaded "*Claude*" package
+    # from an unknown publisher — that would let a malicious package hijack the
+    # patcher's elevated path operations.
+    $candidates = @(Get-AppxPackage | Where-Object {
+        ($_.Name -like 'AnthropicPBC*' -or $_.Publisher -match 'CN=Anthropic') `
+        -and $_.InstallLocation -like '*WindowsApps*'
+    })
+
+    if ($candidates.Count -gt 1) {
+        Write-Warn "Multiple Anthropic Claude packages detected:"
+        foreach ($c in $candidates) {
+            Write-Warn "  $($c.PackageFullName) -> $($c.InstallLocation)"
+        }
+        throw "Ambiguous Claude installation. Uninstall older packages and re-run."
+    }
+    if ($candidates.Count -eq 1) { return $candidates[0].InstallLocation }
     # Strict filter: AnthropicPBC* package name OR publisher cert subject contains
     # "CN=Anthropic". Refuses to silently pick a sideloaded "*Claude*" package
     # from an unknown publisher — that would let a malicious package hijack the
@@ -900,8 +926,32 @@ function Get-CoworkSvc {
     }
 }
 
+function Get-CoworkSvc {
+    # Replaces Get-WmiObject (deprecated, removed in PowerShell 7) with
+    # Get-CimInstance, which works on both Windows PowerShell 5.1 and 7+.
+    try {
+        return Get-CimInstance -ClassName Win32_Service -ErrorAction Stop |
+            Where-Object { $_.PathName -match "cowork-svc" } |
+            Select-Object -First 1
+    } catch {
+        Write-Warn "CIM query for Win32_Service failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Stop-ClaudeServices {
     Write-Step "Halting Claude processes and services..."
+
+    # 1. Stop the Windows service via CIM
+    $svc = Get-CoworkSvc
+    if ($svc) {
+        Write-Log "Stopping service: $($svc.Name) (State: $($svc.State))"
+        try {
+            Stop-Service -Name $svc.Name -Force -ErrorAction Stop
+        } catch {
+            Write-Warn "Stop-Service failed for $($svc.Name): $($_.Exception.Message)"
+        }
+
 
     # 1. Stop the Windows service via CIM
     $svc = Get-CoworkSvc
@@ -916,13 +966,16 @@ function Stop-ClaudeServices {
         $timeout = 10
         for ($w = 0; $w -lt $timeout; $w++) {
             $state = (Get-Service -Name $svc.Name -ErrorAction SilentlyContinue).Status
+            $state = (Get-Service -Name $svc.Name -ErrorAction SilentlyContinue).Status
             if ($state -eq 'Stopped' -or -not $state) { break }
             Start-Sleep -Seconds 1
         }
         Write-Log "Service state after stop: $((Get-Service -Name $svc.Name -ErrorAction SilentlyContinue).Status)"
+        Write-Log "Service state after stop: $((Get-Service -Name $svc.Name -ErrorAction SilentlyContinue).Status)"
     } else {
         Write-Log "No cowork-svc Windows service found."
     }
+
 
     # 2. Kill any remaining processes
     foreach ($procName in @("claude", "cowork-svc")) {
@@ -933,8 +986,14 @@ function Stop-ClaudeServices {
                 try { Stop-Process -Id $p.Id -Force -ErrorAction Stop }
                 catch { Write-Warn "Stop-Process failed for $procName($($p.Id)): $($_.Exception.Message)" }
             }
+            foreach ($p in $procs) {
+                try { Stop-Process -Id $p.Id -Force -ErrorAction Stop }
+                catch { Write-Warn "Stop-Process failed for $procName($($p.Id)): $($_.Exception.Message)" }
+            }
         }
     }
+
+    # 3. Verify processes are gone
 
     # 3. Verify processes are gone
     Start-Sleep -Seconds 2
@@ -944,7 +1003,10 @@ function Stop-ClaudeServices {
         Start-Sleep -Seconds 5
         try { Stop-Process -Name "cowork-svc" -Force -ErrorAction Stop }
         catch { Write-Warn "Final cowork-svc kill failed: $($_.Exception.Message)" }
+        try { Stop-Process -Name "cowork-svc" -Force -ErrorAction Stop }
+        catch { Write-Warn "Final cowork-svc kill failed: $($_.Exception.Message)" }
     }
+
 
     Write-Success "Processes and services halted."
 }
@@ -1314,6 +1376,9 @@ function Start-ClaudeServices {
     $cimSvc = Get-CoworkSvc
     if ($cimSvc) {
         $svcName = $cimSvc.Name
+    $cimSvc = Get-CoworkSvc
+    if ($cimSvc) {
+        $svcName = $cimSvc.Name
         $currentState = (Get-Service -Name $svcName -ErrorAction SilentlyContinue).Status
         
         if ($currentState -ne 'Stopped') {
@@ -1355,11 +1420,16 @@ function Start-ClaudeServices {
         }
     } else {
         Write-Warn "cowork-svc service not found via CIM."
+        Write-Warn "cowork-svc service not found via CIM."
     }
 
     # 2. Launch Claude Desktop UI
     Write-Log "Launching Claude Desktop..."
     Try {
+        $pkg = Get-AppxPackage | Where-Object {
+            ($_.Name -like 'AnthropicPBC*' -or $_.Publisher -match 'CN=Anthropic') `
+            -and $_.InstallLocation -like '*WindowsApps*'
+        } | Select-Object -First 1
         $pkg = Get-AppxPackage | Where-Object {
             ($_.Name -like 'AnthropicPBC*' -or $_.Publisher -match 'CN=Anthropic') `
             -and $_.InstallLocation -like '*WindowsApps*'
@@ -1384,7 +1454,27 @@ function Take-Ownership($Path) {
     if (-not (Test-ClaudePathSafe $Path)) {
         throw "Refusing to take ownership of non-Claude path: '$Path'"
     }
+    # Whitelist guard: refuse to operate on anything outside Claude install roots.
+    # Argument arrays via Start-Process avoid shell parsing — no command injection
+    # window if $Path ever picks up an unexpected character.
+    if (-not (Test-ClaudePathSafe $Path)) {
+        throw "Refusing to take ownership of non-Claude path: '$Path'"
+    }
     Write-Log "Requesting permissions for: $Path"
+    Try {
+        Start-Process -FilePath takeown.exe `
+            -ArgumentList @('/F', $Path, '/R', '/D', 'Y') `
+            -Wait -NoNewWindow -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    } Catch {
+        Write-Warn "takeown failed on '$Path': $($_.Exception.Message)"
+    }
+    Try {
+        Start-Process -FilePath icacls.exe `
+            -ArgumentList @($Path, '/grant', 'Administrators:F', '/T', '/Q') `
+            -Wait -NoNewWindow -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    } Catch {
+        Write-Warn "icacls grant failed on '$Path': $($_.Exception.Message)"
+    }
     Try {
         Start-Process -FilePath takeown.exe `
             -ArgumentList @('/F', $Path, '/R', '/D', 'Y') `
@@ -1516,6 +1606,7 @@ $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
 $cachedScript   = Join-Path $stateDir "patch.ps1"
+$cachedScript   = Join-Path $stateDir "patch.ps1"
 
 function Write-WLog($msg) {
     try {
@@ -1626,9 +1717,13 @@ function Invoke-AutoPatch($newVer, $exePath) {
                 '-ExecutionPolicy', 'Bypass',
                 '-File', $cachedScript,
                 '-Auto'
+                '-File', $cachedScript,
+                '-Auto'
             ) | Out-Null
         Write-WLog "Spawned cached patch.ps1 -Auto from $cachedScript"
+        Write-WLog "Spawned cached patch.ps1 -Auto from $cachedScript"
     } catch {
+        Write-WLog "Failed to launch cached patcher: $($_.Exception.Message)"
         Write-WLog "Failed to launch cached patcher: $($_.Exception.Message)"
         Show-Toast "Auto-patch FAILED to start" "Please run patch.ps1 manually as Administrator. See watcher.log."
     }
@@ -1783,10 +1878,16 @@ function Install-Patch {
     Initialize-RtlStateDir
     Backup-AppDirAcl $ClaudeDir
 
+
+    Write-Step "Saving WindowsApps ACL snapshot before modification..."
+    Initialize-RtlStateDir
+    Backup-AppDirAcl $ClaudeDir
+
     Write-Step "Taking ownership of Claude directories..."
     Take-Ownership $AppDir
     Take-Ownership $ResourcesDir
 
+    Write-Step "Creating integrity-checked backups..."
     Write-Step "Creating integrity-checked backups..."
     Wait-FileUnlock -Path $ExePath -TimeoutSeconds 15
     Wait-FileUnlock -Path $CoworkSvcPath -TimeoutSeconds 15
@@ -1809,6 +1910,7 @@ function Install-Patch {
 
     # Always restore from backup before patching — ensures clean state
     # First run: .bak was just created from same file → copy is a no-op (safe)
+    # Re-run: backup is validated by hash above → fresh install on clean files
     # Re-run: backup is validated by hash above → fresh install on clean files
     Write-Step "Ensuring clean state before patching..."
     $RestorePairs = @(
@@ -1869,7 +1971,14 @@ function Install-Patch {
         # re-signing) has succeeded. On failure, the .new files are deleted in
         # the catch block below — originals never need to be restored from .bak
         # because they were never modified.
+        # ATOMIC: stage all three modified files as `.new`. Originals stay
+        # untouched until every step (asar repack, hash replacement, cert swap,
+        # re-signing) has succeeded. On failure, the .new files are deleted in
+        # the catch block below — originals never need to be restored from .bak
+        # because they were never modified.
         $TmpAsarPath = "$AsarPath.new"
+        $TmpExePath  = "$ExePath.new"
+        $TmpSvcPath  = "$CoworkSvcPath.new"
         $TmpExePath  = "$ExePath.new"
         $TmpSvcPath  = "$CoworkSvcPath.new"
         Write-Log "Repacking ASAR archive..."
@@ -1932,6 +2041,16 @@ function Install-Patch {
             # TrustedPublisher is sufficient, switch the StoreName below.
             $CertSubject = $global:RtlCertSubject
             Write-Log "Using local self-signed cert subject: $CertSubject"
+            # 2. CERT SUBJECT — clearly local, never impersonates Anthropic.
+            # The previous build cloned the original Anthropic Subject DN into our
+            # self-signed Root cert: any binary signed by anyone with admin on this
+            # box would then display "Anthropic, PBC" in Windows UI. New behaviour
+            # uses a distinguishing local subject. We still install into the Root
+            # store because cowork-svc's PE cert table is checked against Root for
+            # service trust on some Windows configurations; if a future test shows
+            # TrustedPublisher is sufficient, switch the StoreName below.
+            $CertSubject = $global:RtlCertSubject
+            Write-Log "Using local self-signed cert subject: $CertSubject"
 
             # 3. DYNAMIC CERTIFICATE GENERATION LOOP
             # WHY LocalMachine\Root IS USED (not TrustedPublisher):
@@ -1969,6 +2088,7 @@ function Install-Patch {
             $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
             $Store.Open("ReadWrite")
 
+
             $Cert = $null
             $NewCertBytes = $null
 
@@ -1976,7 +2096,10 @@ function Install-Patch {
                 Write-Log "Generating self-signed certificate (Attempt $Attempts)..."
                 $Cert = New-SelfSignedCertificate -Subject $CertSubject -Type CodeSigningCert -CertStoreLocation "Cert:\LocalMachine\My" -FriendlyName $global:RtlCertFriendly -KeyAlgorithm RSA -KeyLength 2048
 
+                $Cert = New-SelfSignedCertificate -Subject $CertSubject -Type CodeSigningCert -CertStoreLocation "Cert:\LocalMachine\My" -FriendlyName $global:RtlCertFriendly -KeyAlgorithm RSA -KeyLength 2048
+
                 $NewCertBytes = $Cert.RawData
+
 
                 if ($NewCertBytes.Length -le $OldCertSize) {
                     $Store.Add($Cert)
@@ -1984,6 +2107,11 @@ function Install-Patch {
                     Write-Success "Generated certificate fits! (Size: $($NewCertBytes.Length) bytes, Hole: $OldCertSize bytes)"
                 } else {
                     Write-Warn "Certificate too large ($($NewCertBytes.Length) bytes). Removing and retrying..."
+                    Try {
+                        Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint } | Remove-Item -ErrorAction Stop
+                    } Catch {
+                        Write-Warn "Could not remove oversized cert $($Cert.Thumbprint): $($_.Exception.Message)"
+                    }
                     Try {
                         Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint } | Remove-Item -ErrorAction Stop
                     } Catch {
@@ -1997,6 +2125,8 @@ function Install-Patch {
             if (-not $ValidCertFound) {
                 throw "Failed to generate a suitably sized certificate after $MaxAttempts attempts."
             }
+            # Track the freshly issued cert for state.json + clean rollback.
+            $script:LastCertThumbprint = $Cert.Thumbprint
             # Track the freshly issued cert for state.json + clean rollback.
             $script:LastCertThumbprint = $Cert.Thumbprint
 
@@ -2027,7 +2157,12 @@ function Install-Patch {
                 Write-Log "Writing patched claude.exe to staging file ($TmpExePath)..."
                 [System.IO.File]::WriteAllBytes($TmpExePath, $ExeBytes)
                 Write-Success "Replaced $Replacements ASAR hash(es) in claude.exe.new"
+                Write-Log "Writing patched claude.exe to staging file ($TmpExePath)..."
+                [System.IO.File]::WriteAllBytes($TmpExePath, $ExeBytes)
+                Write-Success "Replaced $Replacements ASAR hash(es) in claude.exe.new"
             } else {
+                Write-Warn "Old hash not found in claude.exe. Writing unmodified copy to staging."
+                [System.IO.File]::WriteAllBytes($TmpExePath, $ExeBytes)
                 Write-Warn "Old hash not found in claude.exe. Writing unmodified copy to staging."
                 [System.IO.File]::WriteAllBytes($TmpExePath, $ExeBytes)
             }
@@ -2036,7 +2171,12 @@ function Install-Patch {
             $SignResult = Set-AuthenticodeSignature -FilePath $TmpExePath -Certificate $Cert -HashAlgorithm SHA256
             if ($SignResult.Status -eq 'Valid') { Write-Success "Successfully re-signed claude.exe.new" }
             else { throw "Re-signing claude.exe.new failed: $($SignResult.Status)" }
+            Write-Log "Re-signing claude.exe.new (this can take several seconds)..."
+            $SignResult = Set-AuthenticodeSignature -FilePath $TmpExePath -Certificate $Cert -HashAlgorithm SHA256
+            if ($SignResult.Status -eq 'Valid') { Write-Success "Successfully re-signed claude.exe.new" }
+            else { throw "Re-signing claude.exe.new failed: $($SignResult.Status)" }
 
+            # 5. EXACT PADDING AND BINARY SWAP IN COWORK-SVC.EXE (staged)
             # 5. EXACT PADDING AND BINARY SWAP IN COWORK-SVC.EXE (staged)
             $Diff = $OldCertSize - $NewCertBytes.Length
             Write-Log "Swapping cowork-svc cert and padding with $Diff bytes of 0x00..."
@@ -2047,13 +2187,33 @@ function Install-Patch {
             [Array]::Copy($PaddedCert, 0, $SvcBytes, $StartPos, $OldCertSize)
             [System.IO.File]::WriteAllBytes($TmpSvcPath, $SvcBytes)
             Write-Success "Binary cert replacement written to cowork-svc.exe.new"
+            [System.IO.File]::WriteAllBytes($TmpSvcPath, $SvcBytes)
+            Write-Success "Binary cert replacement written to cowork-svc.exe.new"
 
             # 6. SIGN COWORK-SVC.EXE.NEW
             Write-Log "Re-signing cowork-svc.exe.new (this can take several seconds)..."
             $SignResult2 = Set-AuthenticodeSignature -FilePath $TmpSvcPath -Certificate $Cert -HashAlgorithm SHA256
             if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe.new" }
             else { throw "Re-signing cowork-svc.exe.new failed: $($SignResult2.Status)" }
+            # 6. SIGN COWORK-SVC.EXE.NEW
+            Write-Log "Re-signing cowork-svc.exe.new (this can take several seconds)..."
+            $SignResult2 = Set-AuthenticodeSignature -FilePath $TmpSvcPath -Certificate $Cert -HashAlgorithm SHA256
+            if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe.new" }
+            else { throw "Re-signing cowork-svc.exe.new failed: $($SignResult2.Status)" }
 
+            # 7. ATOMIC COMMIT — every staging file is signed and validated.
+            # Replace originals now. If any Move-Item fails mid-commit (rare —
+            # would require a new lock between Wait-FileUnlock and Move-Item),
+            # the catch block restores from .bak.
+            Wait-FileUnlock $AsarPath
+            Wait-FileUnlock $ExePath
+            Wait-FileUnlock $CoworkSvcPath
+            Move-Item -Path $TmpAsarPath -Destination $AsarPath       -Force
+            Move-Item -Path $TmpExePath  -Destination $ExePath        -Force
+            Move-Item -Path $TmpSvcPath  -Destination $CoworkSvcPath  -Force
+            Write-Success "Atomic commit: app.asar / claude.exe / cowork-svc.exe replaced."
+
+            # 8. WIPE PRIVATE KEY: public cert stays in Root for verification, but the
             # 7. ATOMIC COMMIT — every staging file is signed and validated.
             # Replace originals now. If any Move-Item fails mid-commit (rare —
             # would require a new lock between Wait-FileUnlock and Move-Item),
@@ -2147,6 +2307,18 @@ function Install-Patch {
             }
         }
 
+
+        # Delete any leftover staging files. Originals were never replaced if
+        # the failure happened pre-commit; if it happened during commit (after
+        # one Move-Item but before another), Restore-Patch below recovers from
+        # validated .bak files.
+        foreach ($staging in @("$AsarPath.new", "$ExePath.new", "$CoworkSvcPath.new")) {
+            if (Test-Path -LiteralPath $staging) {
+                Try { Remove-Item -LiteralPath $staging -Force -ErrorAction Stop }
+                Catch { Write-Warn "Could not delete staging file $staging : $($_.Exception.Message)" }
+            }
+        }
+
         Restore-Patch -IsRollback
 
         # Don't claim a successful restore here — Restore-Patch may have aborted
@@ -2162,6 +2334,7 @@ function Restore-Patch {
     if (-not $IsRollback) {
         Write-Host "`n=======================================================" -ForegroundColor Cyan
         Write-Host "     RESTORING CLAUDE & REMOVING PATCHER PERSISTENCE" -ForegroundColor Cyan
+        Write-Host "     RESTORING CLAUDE & REMOVING PATCHER PERSISTENCE" -ForegroundColor Cyan
         Write-Host "=======================================================`n" -ForegroundColor Cyan
     } else {
         Write-Step "Executing Fallback Rollback..."
@@ -2169,9 +2342,15 @@ function Restore-Patch {
 
     $ClaudeDir = Find-ClaudeDir
     if (-not $ClaudeDir) {
+    if (-not $ClaudeDir) {
         if ($IsRollback) { Write-Warn "Claude Dir not found during rollback." }
         else { Write-Warn "Claude install not found — file restore will be skipped, persistence cleanup will continue." }
+        else { Write-Warn "Claude install not found — file restore will be skipped, persistence cleanup will continue." }
     }
+
+    $AppDir       = if ($ClaudeDir) { Join-Path $ClaudeDir "app" }       else { $null }
+    $ResourcesDir = if ($AppDir)    { Join-Path $AppDir "resources" }    else { $null }
+
 
     $AppDir       = if ($ClaudeDir) { Join-Path $ClaudeDir "app" }       else { $null }
     $ResourcesDir = if ($AppDir)    { Join-Path $AppDir "resources" }    else { $null }
@@ -2356,9 +2535,39 @@ function Show-Menu {
         Write-Host "  4. Enable Auto Re-Patch After Each Claude Update (Background Service)" -ForegroundColor Green
         Write-Host "  5. Disable Auto Re-Patch Service (only removes Scheduled Task; use 2 for full cleanup)" -ForegroundColor White
         Write-Host "  6. Exit" -ForegroundColor White
+    # Iterative loop instead of recursive self-call. Behaviour identical to
+    # users (Clear-Host on each redraw, same prompts), but no stack growth on
+    # long sessions and a single, predictable exit point.
+    while ($true) {
+        Clear-Host
+        Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║    Claude Desktop Smart RTL & Service Patcher    ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host "`nSelect an action:"
+        Write-Host "  1. Install Smart RTL Patch (Full Hebrew Support)" -ForegroundColor White
+        Write-Host "  2. Restore Original State (full revert: files + cert + Scheduled Task + state)" -ForegroundColor White
+        Write-Host "  3. Create 'Quick Update' Desktop Shortcut" -ForegroundColor Green
+        Write-Host "  4. Enable Auto Re-Patch After Each Claude Update (Background Service)" -ForegroundColor Green
+        Write-Host "  5. Disable Auto Re-Patch Service (only removes Scheduled Task; use 2 for full cleanup)" -ForegroundColor White
+        Write-Host "  6. Exit" -ForegroundColor White
 
         $choice = Read-Host "`nEnter your choice (1/2/3/4/5/6)"
+        $choice = Read-Host "`nEnter your choice (1/2/3/4/5/6)"
 
+        if ($choice -eq '1' -or $choice -eq '2') {
+            Write-Host "`nWARNING: This will automatically close Claude Desktop and its background services." -ForegroundColor Yellow
+            if ($choice -eq '2') {
+                Write-Host "Restore will: revert app.asar / claude.exe / cowork-svc.exe from validated .bak files," -ForegroundColor Yellow
+                Write-Host "             remove the auto-update Scheduled Task," -ForegroundColor Yellow
+                Write-Host "             remove the patcher's self-signed certificate from My/Root/TrustedPublisher," -ForegroundColor Yellow
+                Write-Host "             restore WindowsApps ACLs, and clean state files in ProgramData." -ForegroundColor Yellow
+            }
+            $confirm = Read-Host "Do you want to continue? (Y/n)"
+            if ($confirm -eq 'n' -or $confirm -eq 'N') {
+                Write-Host "Operation cancelled."
+                Start-Sleep -Seconds 2
+                continue
+            }
         if ($choice -eq '1' -or $choice -eq '2') {
             Write-Host "`nWARNING: This will automatically close Claude Desktop and its background services." -ForegroundColor Yellow
             if ($choice -eq '2') {
@@ -2381,7 +2590,36 @@ function Show-Menu {
                 Write-Host "`n[!] Final Script Status:" -ForegroundColor DarkGray
                 Write-Host $_.Exception.Message -ForegroundColor Red
             }
+            try {
+                if ($choice -eq '1') { Install-Patch }
+                else { Restore-Patch }
+            } catch {
+                Write-Host "`n[!] Final Script Status:" -ForegroundColor DarkGray
+                Write-Host $_.Exception.Message -ForegroundColor Red
+            }
 
+            Write-Host "`nPress Enter to exit..."
+            $null = Read-Host
+            return
+        }
+        elseif ($choice -eq '3') {
+            Create-UpdateShortcut
+            Write-Host "`nPress Enter to return to menu..."
+            $null = Read-Host
+        }
+        elseif ($choice -eq '4') {
+            try { Install-AutoUpdateTask } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+            Write-Host "`nPress Enter to return to menu..."
+            $null = Read-Host
+        }
+        elseif ($choice -eq '5') {
+            try { Uninstall-AutoUpdateTask } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+            Write-Host "`nPress Enter to return to menu..."
+            $null = Read-Host
+        }
+        elseif ($choice -eq '6') { return }
+        # else: invalid input — fall through and redraw the menu.
+    }
             Write-Host "`nPress Enter to exit..."
             $null = Read-Host
             return
@@ -2419,6 +2657,12 @@ if ($Auto) {
         $exitCode = 1
     }
 
+    # Auto mode is invoked by the Scheduled Task on logon — the user is not
+    # interactively watching this window. Read-Host would block the spawned
+    # PowerShell forever (the task uses -NoExit-style behaviour via -File).
+    # Sleep briefly so any toast/log output is visible, then exit cleanly.
+    Write-Host "`nClosing in 8 seconds..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 8
     # Auto mode is invoked by the Scheduled Task on logon — the user is not
     # interactively watching this window. Read-Host would block the spawned
     # PowerShell forever (the task uses -NoExit-style behaviour via -File).
