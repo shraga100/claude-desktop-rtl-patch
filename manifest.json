@@ -2,10 +2,10 @@
     "version":  "v2.0.0",
     "files":  {
                   "patch.ps1":  {
-                                    "sha256":  "86745f55aa4a0fdbe262f5210dc013a5080384d6b85c61307f68d3697fb9f679"
+                                    "sha256":  "8a975f105589b138a7ccc8cb2b1c9919d656e7472e50af791d58e37ad9a5ca0c"
                                 },
                   "install.ps1":  {
-                                      "sha256":  "e66e3df70002df6887ea62bfdc3e81add25287d874e303c9607c53535f500c83"
+                                      "sha256":  "d5c785e1f7d2ad330e6019c01b6147a98eb4b2e8289eb32c8ecd60447b613a16"
                                   },
                   "update-local-patcher.ps1":  {
                                                    "sha256":  "65d42eb29de1bd20ef0712119a9a868d3500793e093ce15ff6806937fbb50f72"
