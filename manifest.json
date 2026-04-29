@@ -1,8 +1,8 @@
-﻿{
-    "version":  "v2.0.0",
+{
+    "version":  "v2.0.1",
     "files":  {
                   "patch.ps1":  {
-                                    "sha256":  "8a975f105589b138a7ccc8cb2b1c9919d656e7472e50af791d58e37ad9a5ca0c"
+                                    "sha256":  "493372b5a69101feec93b5b50154ac6751064a7e2cccb18c8ce5a61db47beff9"
                                 },
                   "install.ps1":  {
                                       "sha256":  "d5c785e1f7d2ad330e6019c01b6147a98eb4b2e8289eb32c8ecd60447b613a16"
