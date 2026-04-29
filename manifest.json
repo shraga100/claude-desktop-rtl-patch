@@ -1,0 +1,17 @@
+{
+    "version":  "v2.0.1",
+    "files":  {
+                  "patch.ps1":  {
+                                    "sha256":  "493372b5a69101feec93b5b50154ac6751064a7e2cccb18c8ce5a61db47beff9"
+                                },
+                  "install.ps1":  {
+                                      "sha256":  "d5c785e1f7d2ad330e6019c01b6147a98eb4b2e8289eb32c8ecd60447b613a16"
+                                  },
+                  "update-local-patcher.ps1":  {
+                                                   "sha256":  "65d42eb29de1bd20ef0712119a9a868d3500793e093ce15ff6806937fbb50f72"
+                                               },
+                  "asar-3.2.10.tgz":  {
+                                          "sha256":  "8c3af8b089e3e80093d1f2169248d53b15e4e0ae140b34d0dc9d6d43ab3caf79"
+                                      }
+              }
+}
