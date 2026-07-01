@@ -1779,6 +1779,10 @@ $repoBase       = "https://raw.githubusercontent.com/shraga100/claude-desktop-rt
 $patchUrl       = "$repoBase/patch.ps1"
 $sigUrl         = "$repoBase/patch.ps1.sig"
 
+# Tracks when the windowed claude.exe was first seen unresponsive, so Restart-IfHung
+# only acts on a *sustained* hang (guards against transient "busy" blips).
+$script:hungSince = $null
+
 function Write-WLog($msg) {
     try {
         if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
@@ -1960,6 +1964,61 @@ function Test-AndPatch($exePath) {
     if ($newVer -gt $patchedVer) { Invoke-AutoPatch -newVer $newVer -exePath $exePath }
 }
 
+function Get-ClaudeAumid {
+    # Version-independent launch target. A hung process's own .Path points into
+    # the OLD versioned WindowsApps folder, which may already be removed after the
+    # MSIX update swap, so we relaunch via the app's AUMID instead.
+    try {
+        $a = Get-StartApps | Where-Object { $_.AppID -like 'Claude_*!*' } | Select-Object -First 1
+        if ($a) { return $a.AppID }
+    } catch {}
+    try {
+        $p = Get-AppxPackage -Name 'Claude*' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($p) { return "$($p.PackageFamilyName)!Claude" }
+    } catch {}
+    return $null
+}
+
+function Restart-IfHung {
+    # Claude's MSIX self-update (often applied on resume from Modern Standby) can
+    # leave the previously-running patched claude.exe "not responding" forever --
+    # Windows logs it as Application Hang (Event 1002, MoAppHang) and the user is
+    # stuck with a frozen window that never recovers on its own. Detect a SUSTAINED
+    # hang (>=90s) and cleanly restart Claude. This never touches the signature-
+    # verify / auto-patch path. Only the process that owns a main window is checked:
+    # Responding is meaningful only for windowed processes (Electron spawns many
+    # windowless helpers that always report Responding = $true).
+    try {
+        $win = Get-Process -Name claude -ErrorAction SilentlyContinue |
+               Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+        if (-not $win) { $script:hungSince = $null; return }
+        if ($win.Responding) { $script:hungSince = $null; return }
+
+        if (-not $script:hungSince) {
+            $script:hungSince = [DateTime]::Now
+            Write-WLog "claude.exe (PID $($win.Id)) not responding -- watching for sustained hang."
+            return
+        }
+        if (([DateTime]::Now - $script:hungSince).TotalSeconds -lt 90) { return }
+
+        Write-WLog "claude.exe hung >90s -- killing stale processes and relaunching."
+        Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        $script:hungSince = $null
+        Start-Sleep -Seconds 2
+        $aumid = Get-ClaudeAumid
+        if ($aumid) {
+            Start-Process "explorer.exe" "shell:AppsFolder\$aumid" | Out-Null
+            Write-WLog "Relaunched Claude via AUMID $aumid"
+            Show-Toast "Claude was frozen" "Detected a hung Claude window (likely after an update or resume from sleep) and restarted it."
+        } else {
+            Write-WLog "Could not resolve Claude AUMID -- not relaunching."
+        }
+    } catch {
+        Write-WLog "Restart-IfHung error: $($_.Exception.Message)"
+    }
+}
+
 Write-WLog "Watcher started (PID $PID, user $env:USERNAME)"
 Write-WLog "Currently patched version: $(Get-PatchedVer)"
 
@@ -1974,8 +2033,8 @@ Register-CimIndicationEvent -Query $query -SourceIdentifier "ClaudeProcessCreate
 Write-WLog "WMI subscription active. Idling..."
 
 while ($true) {
-    $ev = Wait-Event -SourceIdentifier "ClaudeProcessCreated" -Timeout 3600
-    if ($null -eq $ev) { continue }
+    $ev = Wait-Event -SourceIdentifier "ClaudeProcessCreated" -Timeout 60
+    if ($null -eq $ev) { Restart-IfHung; continue }   # periodic hang check (~every 60s)
     try {
         $p = $ev.SourceEventArgs.NewEvent.TargetInstance.ExecutablePath
         Test-AndPatch $p
