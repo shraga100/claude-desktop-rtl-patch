@@ -62,7 +62,7 @@ A UAC prompt will appear. Click **Yes** to grant administrator privileges, then 
 | Requirement | Notes |
 | :--- | :--- |
 | **Windows 10 / 11** | With Claude Desktop installed ([download](https://downloads.claude.ai/releases/win32/ClaudeSetup.exe)) |
-| **Node.js** | `npx` must be on your PATH ([nodejs.org](https://nodejs.org/)), used to repack the app archive |
+| **Node.js** | Node 22.12.0 or newer on your PATH ([nodejs.org](https://nodejs.org/)); `npx` is only needed for the optional Electron fuse fallback |
 | **Administrator** | The installer elevates automatically via UAC |
 
 > [!IMPORTANT]
@@ -143,7 +143,7 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 
 ## 🛠️ Troubleshooting
 
-**"Node.js (npx) is required":** Install Node.js from [nodejs.org](https://nodejs.org/) and reopen PowerShell.
+**Node.js missing or too old:** Install Node.js 22.12.0 or newer from [nodejs.org](https://nodejs.org/) and reopen PowerShell.
 
 **Claude won't start after patching:** Run the script again, choose **2 (Restore)**, then **1 (Install)**.
 
@@ -161,7 +161,15 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 
 Claude Desktop is a **digitally signed** Electron app, so editing its UI code breaks the integrity checks. The patch works around this in three phases, all atomic, with automatic rollback on failure:
 
-**Phase 1, ASAR injection.** Claude's UI lives inside `app.asar`. The script extracts it with `npx @electron/asar`, prepends the RTL-detection payload to the renderer files (and forces the window UI to LTR in the main process), repacks the archive, and computes its new SHA-256 header hash. The payload's detection logic lives in [`src/rtl-core.js`](src/rtl-core.js) (pure, unit-tested) plus [`src/rtl-payload.js`](src/rtl-payload.js) (DOM layer); `tools/build-payload.ps1` assembles them into `patch.ps1`.
+**Phase 1, ASAR injection.** Claude's UI lives inside `app.asar`. A built-in Node helper edits the archive directly, adds the RTL payload to the renderer files, forces the window UI to LTR in the main process, and checks file integrity before replacing the archive. It preserves external native modules and does not extract files or invoke npm. The payload's detection logic lives in [`src/rtl-core.js`](src/rtl-core.js) and [`src/rtl-payload.js`](src/rtl-payload.js); `npm run build` embeds both the payload and the archive helper in `patch.ps1`. See [performance measurements and development checks](docs/patch-performance.md).
+
+| Layer | Protection | Limitation |
+| --- | --- | --- |
+| Archive validation | Bounds checks, SHA-256 records and main-entry syntax check | Future unsupported layouts require review |
+| Install transaction | Backups, rollback and a mutex for concurrent installs | Replacing several files is not atomic across a power loss |
+| Temporary helper | Random workspace under the protected state directory | Administrator access is still required |
+
+Run `npm run check:security` to check archive validation and rollback behavior.
 
 **Phase 2, hash replacement in `claude.exe`.** The original ASAR hash is stored as an ASCII string inside `claude.exe`. The script does a byte-level search-and-replace to update it. If the format ever changes, it falls back to disabling the Electron integrity fuse.
 

@@ -71,15 +71,233 @@ if (-not $IsAdmin) {
 # -----------------------------------------------------------------------------
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
-$global:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude_rtl_patch_tmp"
+$global:TmpDir = $null
 
-# Pinned npm packages (C4 mitigation). Bump by hand after reviewing the upstream
-# changelog -- never 'latest'.
-$script:AsarPackage  = '@electron/asar@4.2.0'
+# Pinned npm package for the optional fuse fallback (C4 mitigation). Bump by hand
+# after reviewing the upstream changelog -- never 'latest'. ASAR uses built-in Node APIs.
 $script:FusesPackage = '@electron/fuses@2.1.1'
-# Minimum Node the pinned packages run on (both declare engines.node >=22.12.0).
+# Minimum Node supported by the helper and the pinned fuse fallback.
 # Keep in sync when bumping; drives the precise "upgrade Node" error message.
 $script:MinNodeVersion = '22.12.0'
+
+# BEGIN GENERATED FAST ASAR
+$FAST_ASAR_CODE = @'
+'use strict';
+
+// No npm or extraction: preserve ASAR metadata, edit selected packed files,
+// recalculate their Electron integrity records, and verify the completed archive.
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawnSync } = require('node:child_process');
+const MAX_HEADER = 10 * 1024 * 1024;
+const MAX_EDIT = 128 * 1024 * 1024;
+const BLOCK = 4 * 1024 * 1024;
+const SKIP = new Set(['index.js', 'directMcpHost.js', 'nodeHost.js',
+    'shellPathWorker.js', 'transcriptSearchWorker.js']);
+const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+
+function readExact(fd, size, position) {
+    const bytes = Buffer.alloc(size);
+    let read = 0;
+    while (read < size) {
+        const n = fs.readSync(fd, bytes, read, size - read, position + read);
+        if (!n) throw new Error('Truncated ASAR');
+        read += n;
+    }
+    return bytes;
+}
+
+function writeAll(fd, bytes) {
+    let written = 0;
+    while (written < bytes.length) {
+        const n = fs.writeSync(fd, bytes, written, bytes.length - written);
+        if (!n) throw new Error('Short ASAR write');
+        written += n;
+    }
+}
+
+function readArchive(fd) {
+    const size = fs.fstatSync(fd).size;
+    const prefix = readExact(fd, 16, 0);
+    const headerSize = prefix.readUInt32LE(4);
+    const jsonSize = prefix.readUInt32LE(12);
+    if (prefix.readUInt32LE(0) !== 4 || !jsonSize || jsonSize > MAX_HEADER ||
+        headerSize !== 8 + Math.ceil(jsonSize / 4) * 4 ||
+        prefix.readUInt32LE(8) !== headerSize - 4 || 8 + headerSize > size) {
+        throw new Error('Invalid ASAR header');
+    }
+    const header = JSON.parse(readExact(fd, jsonSize, 16).toString('utf8'));
+    const base = 8 + headerSize;
+    const entries = [];
+    function walk(dir, parent, depth) {
+        if (depth > 64 || !dir.files || typeof dir.files !== 'object' || Array.isArray(dir.files)) {
+            throw new Error('Invalid ASAR directory');
+        }
+        for (const [name, entry] of Object.entries(dir.files)) {
+            if (!name || name === '.' || name === '..' || /[\\/:\x00]/.test(name) ||
+                !entry || typeof entry !== 'object') throw new Error('Invalid ASAR entry');
+            const key = parent + name;
+            if (entry.files) { walk(entry, key + '/', depth + 1); continue; }
+            if (entry.link !== undefined) {
+                if (typeof entry.link !== 'string' || path.posix.isAbsolute(entry.link) ||
+                    /[\\:\x00]/.test(entry.link) || entry.link.split('/').includes('..')) {
+                    throw new Error('Unsafe ASAR link');
+                }
+                continue; // Never follow or extract links.
+            }
+            if (!Number.isSafeInteger(entry.size) || entry.size < 0) throw new Error('Invalid ASAR size');
+            if (entry.unpacked) continue; // Keep external native modules external, byte-for-byte.
+            if (typeof entry.offset !== 'string' || !/^\d+$/.test(entry.offset)) throw new Error('Invalid ASAR offset');
+            const offset = Number(entry.offset);
+            if (!Number.isSafeInteger(offset) || offset + entry.size > size - base) throw new Error('ASAR entry out of bounds');
+            if (entry.integrity && (entry.integrity.algorithm !== 'SHA256' ||
+                !Number.isSafeInteger(entry.integrity.blockSize) || entry.integrity.blockSize < 1 ||
+                entry.integrity.blockSize > 64 * 1024 * 1024)) throw new Error('Unsupported ASAR integrity');
+            entries.push({ key, entry, offset, size: entry.size });
+        }
+    }
+    walk(header, '', 0);
+    entries.sort((a, b) => a.offset - b.offset || a.size - b.size);
+    let end = 0;
+    let previous;
+    for (const file of entries) {
+        // Electron ASAR deduplicates identical files at an identical range.
+        if (file.offset < end && !(previous && file.offset === previous.offset && file.size === previous.size)) throw new Error('Overlapping ASAR entries');
+        end = file.offset + file.size;
+        previous = file;
+    }
+    return { header, entries, base };
+}
+
+function integrity(bytes, blockSize = BLOCK) {
+    const blocks = [];
+    for (let i = 0; i < bytes.length; i += blockSize) blocks.push(sha(bytes.subarray(i, i + blockSize)));
+    if (!bytes.length) blocks.push(sha(bytes));
+    return { algorithm: 'SHA256', hash: sha(bytes), blockSize, blocks };
+}
+
+function verify(fd, archive) {
+    for (const file of archive.entries) {
+        const expected = file.entry.integrity;
+        if (!expected) continue;
+        const hash = crypto.createHash('sha256');
+        const blocks = [];
+        for (let i = 0; i < file.size; i += expected.blockSize) {
+            const bytes = readExact(fd, Math.min(expected.blockSize, file.size - i), archive.base + file.offset + i);
+            hash.update(bytes);
+            blocks.push(sha(bytes));
+        }
+        if (!file.size) blocks.push(sha(Buffer.alloc(0)));
+        if (hash.digest('hex') !== expected.hash || JSON.stringify(blocks) !== JSON.stringify(expected.blocks)) {
+            throw new Error('ASAR integrity mismatch: ' + file.key);
+        }
+    }
+}
+
+function encodeHeader(header) {
+    const json = Buffer.from(JSON.stringify(header));
+    if (json.length > MAX_HEADER) throw new Error('ASAR header too large');
+    const buffer = Buffer.alloc(16 + Math.ceil(json.length / 4) * 4);
+    buffer.writeUInt32LE(4, 0);
+    buffer.writeUInt32LE(buffer.length - 8, 4);
+    buffer.writeUInt32LE(buffer.length - 12, 8);
+    buffer.writeUInt32LE(json.length, 12);
+    json.copy(buffer, 16);
+    return buffer;
+}
+
+function inject(content, payload, marker) {
+    if (content.includes(marker)) return null;
+    const prologue = /^\s*("use strict"|'use strict')\s*;/.exec(content);
+    return prologue ? prologue[0] + '\n' + payload + '\n' + content.slice(prologue[0].length) : payload + '\n' + content;
+}
+
+function patchArchive(source, destination, renderer, main) {
+    const started = performance.now();
+    if (path.resolve(source) === path.resolve(destination)) throw new Error('Source must not be overwritten');
+    const input = fs.openSync(source, 'r');
+    let output;
+    let created = false;
+    try {
+        const archive = readArchive(input);
+        verify(input, archive);
+        const pkg = archive.entries.find(f => f.key === 'package.json');
+        if (!pkg || pkg.size > MAX_EDIT) throw new Error('Missing or oversized package.json');
+        const metadata = JSON.parse(readExact(input, pkg.size, archive.base + pkg.offset).toString('utf8'));
+        const mainPath = typeof metadata.main === 'string' ? metadata.main.replace(/^\.\//, '') : '.vite/build/index.pre.js';
+        if (!mainPath.startsWith('.vite/build/') || mainPath.split('/').includes('..')) throw new Error('Unsupported main entry');
+        const changes = new Map();
+        let mainFound = false;
+        let renderers = 0;
+        for (const file of archive.entries) {
+            const isMain = file.key === mainPath;
+            if (!isMain && (!file.key.startsWith('.vite/build/') || !file.key.endsWith('.js') || SKIP.has(path.posix.basename(file.key)))) continue;
+            if (file.size > MAX_EDIT) throw new Error('JavaScript entry too large');
+            const content = readExact(input, file.size, archive.base + file.offset).toString('utf8');
+            const patched = inject(content, isMain ? main : renderer, isMain ? 'CLAUDE RTL MAIN PATCH START' : 'CLAUDE RTL PATCH START');
+            if (isMain) {
+                mainFound = true;
+                const check = spawnSync(process.execPath, ['--check', '--input-type=commonjs'], {
+                    input: patched === null ? content : patched, encoding: 'utf8', windowsHide: true, timeout: 60000
+                });
+                if (check.error || check.status !== 0) throw new Error('Patched main entry failed node --check');
+            } else { renderers++; }
+            if (patched !== null) {
+                const bytes = Buffer.from(patched);
+                changes.set(file.key, bytes);
+                file.entry.size = bytes.length;
+                file.entry.integrity = integrity(bytes, file.entry.integrity?.blockSize || BLOCK);
+            }
+        }
+        if (!mainFound || !renderers) throw new Error('Expected main/renderer entries missing; refusing to patch');
+        let offset = 0;
+        const shared = new Map();
+        const writes = [];
+        for (const file of archive.entries) {
+            const range = file.offset + ':' + file.size;
+            if (!changes.has(file.key) && shared.has(range)) {
+                file.entry.offset = shared.get(range);
+                continue;
+            }
+            file.entry.offset = String(offset);
+            if (!changes.has(file.key)) shared.set(range, file.entry.offset);
+            writes.push(file);
+            offset += file.entry.size;
+        }
+        // Exclusive creation refuses existing files, hardlinks and symlinks.
+        output = fs.openSync(destination, 'wx');
+        created = true;
+        writeAll(output, encodeHeader(archive.header));
+        for (const file of writes) {
+            if (changes.has(file.key)) writeAll(output, changes.get(file.key));
+            else for (let i = 0; i < file.size; i += BLOCK) {
+                writeAll(output, readExact(input, Math.min(BLOCK, file.size - i), archive.base + file.offset + i));
+            }
+        }
+        fs.fsyncSync(output);
+        fs.closeSync(output);
+        output = undefined;
+        const checked = fs.openSync(destination, 'r');
+        try { verify(checked, readArchive(checked)); } finally { fs.closeSync(checked); }
+        return { changed: changes.size, renderers, seconds: Number(((performance.now() - started) / 1000).toFixed(3)) };
+    } catch (error) {
+        if (output !== undefined) { fs.closeSync(output); output = undefined; }
+        if (created) fs.unlinkSync(destination);
+        throw error;
+    } finally { fs.closeSync(input); }
+}
+
+module.exports = { patchArchive, readArchive, encodeHeader, integrity, verify, inject };
+if (require.main === module) {
+    try {
+        const [source, destination, rendererPath, mainPath] = process.argv.slice(2);
+        const result = patchArchive(source, destination, fs.readFileSync(rendererPath, 'utf8'), fs.readFileSync(mainPath, 'utf8'));
+        console.log(`Verified ASAR: ${result.changed} files changed, ${result.renderers} renderer files, ${result.seconds}s`);
+    } catch (error) { console.error('ASAR patch failed: ' + error.message); process.exitCode = 1; }
+}
+'@
+# END GENERATED FAST ASAR
 
 # Exact JS logic from r.js
 $RTL_INJECTION_CODE = @'
@@ -2158,8 +2376,8 @@ function Start-ClaudeServices {
 
 function Take-Ownership($Path) {
     Write-Log "Requesting permissions for: $Path"
-    cmd.exe /c "takeown /F `"$Path`" /R /D Y >nul 2>&1"
-    cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:(OI)(CI)F`" /T /Q >nul 2>&1"
+    cmd.exe /c "takeown /F `"$Path`" /A >nul 2>&1"
+    cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:F`" /Q >nul 2>&1"
 }
 
 function Remove-CertPrivateKey {
@@ -2732,7 +2950,37 @@ function Uninstall-AutoUpdateTask {
 # -----------------------------------------------------------------------------
 # CORE PATCHING LOGIC (WITH ATOMIC FALLBACK)
 # -----------------------------------------------------------------------------
+function Remove-FastWorkspace {
+    if (-not $global:TmpDir -or -not (Test-Path -LiteralPath $global:TmpDir)) { return }
+    $resolved = [IO.Path]::GetFullPath($global:TmpDir)
+    $parent = [IO.Path]::GetFullPath($global:RtlStateDir).TrimEnd('\')
+    if ((Split-Path $resolved -Parent) -ne $parent -or (Split-Path $resolved -Leaf) -notmatch '^work-[0-9a-f]{32}$') {
+        throw 'Refusing to clean a workspace outside the protected state directory.'
+    }
+    if ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Refusing to clean a linked workspace.'
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+    $global:TmpDir = $null
+}
+
 function Install-Patch {
+    # The watcher and shortcut can overlap; never let two transactions write the
+    # same ASAR/executable pair or roll back each other's work.
+    $patchMutex = New-Object Threading.Mutex($false, 'Global\ClaudeRtlPatch.Install')
+    $ownsMutex = $false
+    try {
+        try { $ownsMutex = $patchMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
+        if (-not $ownsMutex) { throw 'Another RTL patch is already running. Please wait for it to finish.' }
+        Install-PatchCore
+    } finally {
+        if ($ownsMutex) { $patchMutex.ReleaseMutex() }
+        $patchMutex.Dispose()
+    }
+}
+
+function Install-PatchCore {
     Write-Host "`n=======================================================" -ForegroundColor Cyan
     Write-Host "     INSTALLING CLAUDE SMART RTL PATCH" -ForegroundColor Cyan
     Write-Host "=======================================================`n" -ForegroundColor Cyan
@@ -2749,56 +2997,37 @@ function Install-Patch {
 
     if (-not (Test-Path $AsarPath)) { throw "app.asar not found!" }
 
-    Try {
-        $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
-        if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
-    } Catch {
-        # npx probe failed -- two causes: (1) npx unreachable (e.g. a Volta shim broken
-        # under the elevated PATH) -- retry with system Node at ProgramFiles\nodejs;
-        # (2) Node older than MinNodeVersion, so the pinned packages refuse to run --
-        # surface the version and tell the user to upgrade, not "install Node" (#11).
-        $sysNodeDir = Join-Path $env:ProgramFiles 'nodejs'
-        $ok = $false
-        if ((Test-Path (Join-Path $sysNodeDir 'node.exe')) -and `
-            (Test-Path (Join-Path $sysNodeDir 'npx.cmd'))) {
-            $env:PATH = "$sysNodeDir;$env:PATH"
-            Write-Log "npx probe failed; retrying with system Node at $sysNodeDir"
-            $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
-            $ok = ($LASTEXITCODE -eq 0)
-        }
-        if (-not $ok) {
-            # Record npx's real output so the failure is diagnosable from patch.log.
-            if ($cmdOut) { Write-Log "npx output: $(($cmdOut | Out-String).Trim())" }
-
-            # Detect the installed Node version to give an accurate error.
-            $nodeVer = $null
-            try {
-                $raw = (cmd.exe /c "node --version 2>&1" | Out-String).Trim()
-                if ($raw -match 'v?(\d+)\.(\d+)\.(\d+)') {
-                    $nodeVer = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
-                }
-            } catch {}
-
-            $minVer = [version]$script:MinNodeVersion
-            if ($nodeVer -and $nodeVer -lt $minVer) {
-                throw ("Node $nodeVer is too old. This patch requires Node " +
-                    ">= $($script:MinNodeVersion) (Node $nodeVer is past end-of-life). " +
-                    "Please upgrade Node from https://nodejs.org and re-run.")
-            } elseif (-not $nodeVer) {
-                throw ("Node.js (npx) is required. Please install Node.js " +
-                    "(>= $($script:MinNodeVersion)) from https://nodejs.org and re-run.")
-            } else {
-                throw ("npx could not run $($script:AsarPackage) on Node $nodeVer. " +
-                    "See the npx output in the log: $global:PatchLogFile")
+    # Local Node probe: no npm registry calls or package downloads on the hot path.
+    $script:NodePath = $null
+    $nodeOnPath = Get-Command node.exe -ErrorAction SilentlyContinue
+    $nodeCandidates = @($nodeOnPath.Source, (Join-Path $env:ProgramFiles 'nodejs\node.exe')) |
+        Where-Object { $_ } | Select-Object -Unique
+    foreach ($candidate in $nodeCandidates) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        try {
+            $nodeOutput = & $candidate --version 2>$null
+            if ($LASTEXITCODE -eq 0 -and $nodeOutput -match '^v(\d+\.\d+\.\d+)$' -and
+                [version]$Matches[1] -ge [version]$script:MinNodeVersion) {
+                $script:NodePath = $candidate
+                # Keep the system-Node fallback for broken elevated PATH shims (#11).
+                $env:PATH = (Split-Path $candidate -Parent) + ';' + $env:PATH
+                break
             }
-        }
+        } catch { continue }
     }
+    if (-not $script:NodePath) {
+        throw "Node >= $($script:MinNodeVersion) is required. Install or upgrade Node from https://nodejs.org and reopen PowerShell."
+    }
+    if (-not (Protect-RtlStateDir)) { throw 'Cannot secure patch workspace.' }
 
     Stop-ClaudeServices
     
     Write-Step "Taking ownership of Claude directories..."
     Take-Ownership $AppDir
     Take-Ownership $ResourcesDir
+    foreach ($target in @($AsarPath, $ExePath, $CoworkSvcPath, "$AsarPath.bak", "$ExePath.bak", "$CoworkSvcPath.bak")) {
+        if (Test-Path -LiteralPath $target) { Take-Ownership $target }
+    }
 
     # PREFLIGHT: verify every write target is writable before touching content (must run
     # after the ownership grant + service stop above). Aborts cleanly, install untouched.
@@ -2850,140 +3079,25 @@ function Install-Patch {
         $OldHash = Compute-AsarHash $AsarPath
         Write-Log "Original Hash: $OldHash"
 
-        if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
-        Write-Log "Extracting ASAR archive (this may take a moment)..."
-        cmd.exe /c "npx --yes $($script:AsarPackage) extract `"$AsarPath`" `"$global:TmpDir`""
-        if ($LASTEXITCODE -ne 0) {
-            throw "asar extract failed with exit code $LASTEXITCODE. Aborting before pack would create an empty archive."
-        }
-
-        $BuildDir = Join-Path $global:TmpDir ".vite\build"
-        if (Test-Path $BuildDir) {
-            # Resolve the main-process entry from package.json "main" (fallback to the
-            # known filename). The ENTRY alone gets $MAIN_INJECTION_CODE, NOT the renderer payload.
-            $MainEntryFile = 'index.pre.js'
-            $PkgJsonPath = Join-Path $global:TmpDir 'package.json'
-            if (Test-Path $PkgJsonPath) {
-                try {
-                    $pkgMain = (Get-Content $PkgJsonPath -Raw | ConvertFrom-Json).main
-                    if ($pkgMain) { $MainEntryFile = Split-Path $pkgMain -Leaf }
-                } catch { Write-Log "Could not parse package.json 'main'; defaulting entry to '$MainEntryFile'." }
-            }
-            Write-Log "Main-process entry: $MainEntryFile"
-
-            # Optional custom font (issue #39): splice the sanitized name (or '' when
-            # off) and scope over the payload's placeholders. Runtime substitution on
-            # the in-memory copy -- the signed patch.ps1 on disk is untouched.
-            $FontCfg = Resolve-CustomFont
-            if ($FontCfg.Name) {
-                Write-Success "Custom font enabled: '$($FontCfg.Name)' for $($script:CustomFontScopeDesc[$FontCfg.Scope]) (must be installed on this machine; disable with -CustomFont none)"
-            }
-            $RendererInjection = $RTL_INJECTION_CODE.Replace('__RTL_CUSTOM_FONT__', $FontCfg.Name).Replace('__RTL_CUSTOM_FONT_SCOPE__', $FontCfg.Scope)
-
-            # Non-renderer files that must NOT receive the renderer payload (no DOM;
-            # injecting risks breaking MCP startup -- #14). index.js is the large main
-            # bundle; the rest are Node MCP hosts/workers. All skipped entirely.
-            $SkipEntirely = @(
-                'index.js',                 # .vite/build/index.js         - large main-process bundle
-                'directMcpHost.js',         # .vite/build/mcp-runtime/...  - Node MCP host
-                'nodeHost.js',              # .vite/build/mcp-runtime/...  - Node host
-                'shellPathWorker.js',       # .vite/build/shell-path-worker/...
-                'transcriptSearchWorker.js' # .vite/build/transcript-search-worker/...
-            )
-            $JsFiles = Get-ChildItem -Path $BuildDir -Filter "*.js" -Recurse
-            $Injected = 0
-            $MainInjected = 0
-            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-            # A leading "use strict"; must stay the FIRST statement; both branches below
-            # insert AFTER it (a bare prepend would demote it to sloppy mode -- #36).
-            $strictRe = '^\s*("use strict"|''use strict'')\s*;'
-            foreach ($file in $JsFiles) {
-                if ($SkipEntirely -contains $file.Name) {
-                    Write-Log "Skipped non-renderer file (no DOM): $($file.Name)"
-                    continue
-                }
-                $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-
-                if ($file.Name -eq $MainEntryFile) {
-                    # Main-process entry: inject the Chromium UI-direction switch only,
-                    # after "use strict"; (see $strictRe note).
-                    if ($content -match "CLAUDE RTL MAIN PATCH START") { continue }
-                    if ($content -match $strictRe) {
-                        $prologue = $matches[0]
-                        $newContent = $prologue + "`n" + $MAIN_INJECTION_CODE + "`n" + $content.Substring($prologue.Length)
-                    } else {
-                        $newContent = $MAIN_INJECTION_CODE + "`n" + $content
-                    }
-                    [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
-
-                    # Fail fast: a syntax error in the ENTRY prevents Claude from starting
-                    # and try/catch can't guard a parse error, so validate before repack.
-                    cmd.exe /c "node --check `"$($file.FullName)`""
-                    if ($LASTEXITCODE -ne 0) {
-                        throw "node --check failed on patched main entry '$($file.Name)'. Refusing to repack -- the injected main-process snippet would prevent Claude from starting."
-                    }
-                    $MainInjected++
-                    Write-Log "Injected MAIN switch (force-ui-direction=ltr) into: $($file.Name)"
-                    continue
-                }
-
-                # Renderer file: inject the RTL/DOM payload after "use strict"; -- a bare
-                # prepend demotes the directive to sloppy mode, which flips detached-call
-                # `this` to globalThis and broke winston's logger fallback (issue #36).
-                if ($content -match "CLAUDE RTL PATCH START") { continue }
-                if ($content -match $strictRe) {
-                    $prologue = $matches[0]
-                    $newContent = $prologue + "`n" + $RendererInjection + "`n" + $content.Substring($prologue.Length)
-                } else {
-                    $newContent = $RendererInjection + "`n" + $content
-                }
-                [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
-                $Injected++
-                Write-Log "Injected RTL into: $($file.Name)"
-            }
-            if ($MainInjected -gt 0) { Write-Success "Injected main-process UI-direction switch into $MainInjected file(s)." }
-            else { Write-Warn "Main-process entry '$MainEntryFile' not found or already patched." }
-            if ($Injected -gt 0) { Write-Success "Injected RTL JS logic into $Injected file(s)." }
-            else { Write-Warn "Renderer JS files already patched or not found." }
-        }
-
-        $TmpAsarPath = "$AsarPath.new"
-        Write-Log "Repacking ASAR archive..."
-        cmd.exe /c "npx --yes $($script:AsarPackage) pack `"$global:TmpDir`" `"$TmpAsarPath`""
-        if ($LASTEXITCODE -ne 0) {
-            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
-            throw "asar pack failed with exit code $LASTEXITCODE."
-        }
-        if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) {
-            # Test-FileValid returns a bare $false, so surface WHY the repacked archive
-            # is unreadable for patch.log (#26). Each probe is guarded; gather all before
-            # deleting the temp.
-            Write-Log "Repacked ASAR validation FAILED -- gathering diagnostics:"
-            try {
-                $diagLen = (Get-Item -LiteralPath $TmpAsarPath -ErrorAction Stop).Length
-                Write-Log "  repacked size: $diagLen bytes"
-            } catch { Write-Log "  could not stat repacked file: $($_.Exception.Message)" }
-            try {
-                $fs = [System.IO.File]::OpenRead($TmpAsarPath)
-                try {
-                    $hdr  = New-Object byte[] 16
-                    $read = $fs.Read($hdr, 0, 16)
-                    $hex  = (0..($read - 1) | ForEach-Object { $hdr[$_].ToString('X2') }) -join ' '
-                    Write-Log "  first $read header bytes (hex): $hex"
-                } finally { $fs.Close() }
-            } catch { Write-Log "  could not read header bytes: $($_.Exception.Message)" }
-            try {
-                $null = Compute-AsarHash $TmpAsarPath
-                Write-Log "  Compute-AsarHash unexpectedly succeeded on retry (transient?)."
-            } catch { Write-Log "  Compute-AsarHash error: $($_.Exception.Message)" }
-            try {
-                $asarVer = (cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1" | Out-String).Trim()
-                Write-Log "  asar package ($($script:AsarPackage)) version: $asarVer"
-            } catch { Write-Log "  could not read asar version: $($_.Exception.Message)" }
-
-            if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
-            throw "Repacked ASAR archive failed integrity check. Refusing to overwrite app.asar. See the 'Repacked ASAR validation' diagnostics above and in patch.log."
-        }
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        # Random workspace under the ACL-protected state directory. No extracted tree.
+        $global:TmpDir = Join-Path $global:RtlStateDir ('work-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $global:TmpDir -ErrorAction Stop | Out-Null
+        $helper = Join-Path $global:TmpDir 'fast-asar.cjs'
+        $rendererFile = Join-Path $global:TmpDir 'renderer.js'
+        $mainFile = Join-Path $global:TmpDir 'main.js'
+        $FontCfg = Resolve-CustomFont
+        $RendererInjection = $RTL_INJECTION_CODE.Replace('__RTL_CUSTOM_FONT__', $FontCfg.Name).Replace('__RTL_CUSTOM_FONT_SCOPE__', $FontCfg.Scope)
+        $utf8 = New-Object Text.UTF8Encoding $false
+        [IO.File]::WriteAllText($helper, $FAST_ASAR_CODE, $utf8)
+        [IO.File]::WriteAllText($rendererFile, $RendererInjection, $utf8)
+        [IO.File]::WriteAllText($mainFile, $MAIN_INJECTION_CODE, $utf8)
+        $TmpAsarPath = Join-Path $ResourcesDir ('app.asar.' + [Guid]::NewGuid().ToString('N') + '.new')
+        Write-Log 'Patching ASAR directly (no extraction, npm or network)...'
+        & $script:NodePath $helper $AsarPath $TmpAsarPath $rendererFile $mainFile | ForEach-Object { Write-Log $_ }
+        if ($LASTEXITCODE -ne 0) { throw 'Direct ASAR patch failed; live archive was not replaced.' }
+        if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) { throw 'Patched ASAR header validation failed.' }
+        Write-Success ('ASAR patch and verification completed in {0:N2}s' -f $timer.Elapsed.TotalSeconds)
 
         $NewHash = Compute-AsarHash $TmpAsarPath
         Write-Log "New Hash: $NewHash"
@@ -3034,10 +3148,16 @@ function Install-Patch {
             # Log the original subject but DON'T clone it: its SERIALNUMBER + jurisdiction
             # OID fields bloat the DER cert (~1136 bytes) past the hole. Pin a compact
             # subject instead (cosmetic -- trust comes from the Root-store entry below).
-            $OriginalSig = Get-AuthenticodeSignature -FilePath $SourceExe
-            if ($OriginalSig -and $OriginalSig.SignerCertificate) {
-                Write-Log "Original certificate subject (for reference): $($OriginalSig.SignerCertificate.Subject)"
-            }
+            # This is informational only. Get-AuthenticodeSignature also builds a
+            # trust chain / checks revocation online, which can stall for minutes.
+            # Read the embedded certificate locally; actual signing verification
+            # below is still mandatory and unchanged.
+            $OriginalCert = $null
+            try {
+                $OriginalCert = [Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($SourceExe)
+                Write-Log "Original certificate subject (for reference): $($OriginalCert.Subject)"
+            } catch { Write-Log 'Original signer metadata unavailable (informational only).' }
+            finally { if ($OriginalCert) { $OriginalCert.Dispose() } }
             $CertSubject = "CN=Anthropic PBC, O=Anthropic PBC, L=San Francisco, S=California, C=US"
             Write-Log "Using compact subject for binary fit: $CertSubject"
 
@@ -3205,7 +3325,7 @@ function Install-Patch {
         }
 
         Write-Step "Cleanup & Launch"
-        if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
+        Remove-FastWorkspace
         Save-PatchState -InstallPath $ClaudeDir
 
         # Pin on EVERY install (not just with the watcher): the desktop shortcut's
@@ -3295,6 +3415,12 @@ function Install-Patch {
         Write-Host "    Reason: $ErrorMessage" -ForegroundColor Red
         Write-Host "    INITIATING AUTOMATIC ROLLBACK TO PREVENT CORRUPTION..." -ForegroundColor Yellow
         
+        # Cleanup is best-effort here: a locked temp file must never prevent the
+        # actual rollback of the live ASAR/executable pair.
+        try {
+            if ($TmpAsarPath -and (Test-Path -LiteralPath $TmpAsarPath)) { Remove-Item -LiteralPath $TmpAsarPath -Force }
+            Remove-FastWorkspace
+        } catch { Write-Warn "Temporary cleanup failed; proceeding with rollback: $($_.Exception.Message)" }
         Restore-Patch -IsRollback
 
         # Don't claim a successful restore -- Restore-Patch may have aborted and prints
@@ -3338,6 +3464,13 @@ function Restore-Patch {
         @{"Orig" = Join-Path $AppDir       "claude.exe";     "Bak" = Join-Path $AppDir       "claude.exe.bak";     "Type" = 'pe'},
         @{"Orig" = Join-Path $ResourcesDir "cowork-svc.exe"; "Bak" = Join-Path $ResourcesDir "cowork-svc.exe.bak"; "Type" = 'pe'}
     )
+    # Take-Ownership no longer walks directories recursively. Restore needs the
+    # same explicit file grants as install, including backups with older ACLs.
+    foreach ($Item in $FilesToRestore) {
+        foreach ($target in @($Item['Orig'], $Item['Bak'])) {
+            if (Test-Path -LiteralPath $target) { Take-Ownership $target }
+        }
+    }
 
     # Validate every backup first: a partial restore (one good .bak, one corrupt) would
     # leave claude.exe's embedded asar hash mismatching app.asar -- worse than now.
