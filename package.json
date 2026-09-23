@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "test": "node --test",
-    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-payload.ps1"
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-payload.ps1 && node tools/build-fast-asar.cjs",
+    "check:security": "node scripts/fast-asar.check.mjs"
   }
 }
