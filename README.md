@@ -91,7 +91,7 @@ When you run the script, you get an interactive menu:
 Claude Desktop updates often, and each update overwrites the patch. Two optional features keep it effortless:
 
 - **Quick Update shortcut (option 3):** a desktop shortcut named **"Update Claude RTL"**. Double-click it to silently fetch and re-apply the latest patch.
-- **Auto-updater (option 4):** a lightweight Windows scheduled task that detects when a new `claude.exe` version launches, re-applies the patch automatically, and shows a notification when it's done.
+- **Auto-updater (option 4):** a lightweight Windows scheduled task that detects when Claude updates, re-applies the patch automatically, and shows a notification when it's done. It also clears a leftover process from the previous version that can stop Claude from reopening after an update.
 
 ---
 
@@ -148,6 +148,14 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 **Claude won't start after patching:** Run the script again, choose **2 (Restore)**, then **1 (Install)**.
 
 **Claude updated and the patch broke:** Run the "Update Claude RTL" shortcut, or use the auto-updater. To fix it manually, delete any `.bak` files in the Claude app directory and run the installer again.
+
+**Claude vanishes after an update and won't reopen until you end it in Task Manager:** Claude's updater installs the new version in the background, but Windows only switches to it once the old version exits. Sometimes the old process stays behind with no window, and every new launch hands off to it and quits. With the auto-updater (option 4), once Windows has switched to the new version the watcher closes the leftover within a minute, re-patches, and reopens Claude. If Claude still hasn't come back after a couple of minutes, end just the desktop app (any Claude Code CLI you have open is left alone) and start Claude again:
+
+```powershell
+Get-Process claude | Where-Object Path -like '*\WindowsApps\*' | Stop-Process -Force
+```
+
+If no Claude process is left and it still won't open, sign out and back in (or restart). In that case Windows is holding a stuck app container rather than a process, so there is nothing to end.
 
 **`Import-Module … The member AuditToString is already present`:** You ran the command in **PowerShell 7 (`pwsh`)**, which has a known bug that breaks the patch. Use the built-in **Windows PowerShell** instead:
 

@@ -1160,6 +1160,10 @@ function Find-AllBytesWithProgress {
 $global:RtlStateDir  = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $global:RtlStateFile = Join-Path $global:RtlStateDir "state.json"
 $global:RtlTaskName  = "ClaudeRtlPatchWatcher"
+# Bump when the watcher body or its task triggers change. The body carries a
+# matching "# watcher-format: N" line; auto-mode re-registers the task when the
+# on-disk watcher lacks it, since auto re-patches don't rewrite watcher.ps1.
+$global:RtlWatcherFormat = 2
 
 # -----------------------------------------------------------------------------
 # OPTIONAL CUSTOM TEXT FONT (issue #39)
@@ -2386,6 +2390,9 @@ function Create-UpdateShortcut {
 # -EncodedCommand -- the encoded form trips Defender's Trojan:Win32/Goptaju
 # heuristic once the body downloads patch.ps1). The watcher only MONITORS for new
 # claude.exe versions; when it fires it fetches patch.ps1 LIVE and runs THAT.
+# Besides launches it runs a 60s idle check (#40/#42): Claude's updater stages new
+# versions with deferred registration, and the outgoing instance can be left behind
+# holding the single-instance lock, so no new claude.exe ever appears to react to.
 # -----------------------------------------------------------------------------
 function Save-WatcherScript {
     try {
@@ -2397,6 +2404,7 @@ function Save-WatcherScript {
 
         # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
         $watcherBody = @'
+# watcher-format: 2
 $ErrorActionPreference = "Continue"
 # Scheduled Task PowerShell defaults to TLS 1.0; GitHub needs 1.2.
 try {
@@ -2452,6 +2460,72 @@ function Get-VerFromPath($p) {
         $cur = Split-Path -Parent $cur
     }
     return $null
+}
+
+# Claude Desktop only runs from its MSIX folder (or WindowsApps\Deleted\ right after
+# a version is replaced). The Claude Code CLI is ALSO claude.exe -- under
+# %APPDATA%\Claude\claude-code\ or ~\.local\bin\ -- and must never match.
+function Test-DesktopClaudePath($p) {
+    return [bool]($p -and $p -match '\\WindowsApps\\(?:Deleted\\)?Claude_')
+}
+
+function Get-DesktopClaude {
+    return @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { Test-DesktopClaudePath $_.Path })
+}
+
+function Write-WLogOnce($key, $msg) {
+    if ($script:LoggedOnce[$key] -eq $msg) { return }
+    $script:LoggedOnce[$key] = $msg
+    Write-WLog $msg
+}
+
+function Get-RegisteredClaude {
+    try {
+        $pkgs = @(Get-AppxPackage -Name Claude -ErrorAction Stop |
+            Where-Object { $_.InstallLocation -like '*\WindowsApps\*' })
+        # One package is the steady state. Two means a version switch is in flight
+        # (possibly a staged package surfacing before registration): skip this check
+        # rather than guess which one is live and kill the running Claude.
+        if ($pkgs.Count -gt 1) {
+            Write-WLogOnce 'appx' "Idle check skipped: $($pkgs.Count) Claude packages listed ($(($pkgs | ForEach-Object { $_.Version }) -join ', '))."
+            return $null
+        }
+        $script:LoggedOnce.Remove('appx')
+        if ($pkgs.Count -eq 0) { return $null }
+        return @{
+            Version         = [Version]$pkgs[0].Version
+            InstallLocation = $pkgs[0].InstallLocation.TrimEnd('\')
+            Aumid           = "$($pkgs[0].PackageFamilyName)!Claude"
+        }
+    } catch {
+        Write-WLogOnce 'appx' "Get-AppxPackage failed: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+# Pure decision for one idle check (unit-tested by test/watcher-recovery.check.ps1).
+#   Stale    -- desktop claude.exe paths outside the registered package. Once a newer
+#               version is registered nothing healthy runs from the old folder, but the
+#               leftover keeps Electron's single-instance lock, so every relaunch exits
+#               immediately (#40, #42). No Responding heuristic: the path alone decides.
+#   Patch    -- the registered version is newer than the patched one while Claude runs
+#               (also covers a launch the WITHIN-1 WMI poll missed). Invoke-AutoPatch
+#               ends the leftovers too, so Patch takes precedence over Stale.
+#   Relaunch -- leftovers were ended and nothing from the registered version runs.
+function Get-TickDecision($Registered, [string[]]$ProcPaths, $PatchedVer, [bool]$PatchAllowed) {
+    $d = @{ Stale = @(); Patch = $false; Relaunch = $false }
+    if (-not $Registered -or -not $Registered.InstallLocation) { return $d }
+    $root    = $Registered.InstallLocation.TrimEnd('\') + '\'
+    $paths   = @($ProcPaths | Where-Object { $_ })
+    $current = @($paths | Where-Object { $_.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) })
+    $stale   = @($paths | Where-Object { -not $_.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) })
+    if ($PatchAllowed -and $PatchedVer -and $Registered.Version -gt $PatchedVer -and $paths.Count -gt 0) {
+        $d.Patch = $true
+    } elseif ($stale.Count -gt 0) {
+        $d.Stale    = $stale
+        $d.Relaunch = ($current.Count -eq 0)
+    }
+    return $d
 }
 
 function Show-Toast($title, $body) {
@@ -2519,6 +2593,7 @@ function Invoke-AutoPatch($newVer, $exePath) {
         } catch {}
     }
     (Get-Date).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
+    $script:PatchAttempted["$newVer"] = $true
 
     Write-WLog "Detected Claude v$newVer at $exePath -- verifying signature before patching..."
 
@@ -2575,7 +2650,8 @@ function Invoke-AutoPatch($newVer, $exePath) {
     $watcherIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($watcherIsAdmin) {
         Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
-        Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-DesktopClaude | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process -Name cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     } else {
         Show-Toast "Claude updated to v$newVer" "The RTL patch needs re-applying. Please approve the admin (UAC) prompt."
     }
@@ -2612,29 +2688,85 @@ function Test-AndPatch($exePath) {
     if ($newVer -gt $patchedVer) { Invoke-AutoPatch -newVer $newVer -exePath $exePath }
 }
 
+function Test-PatchRunning {
+    try {
+        return [bool](Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -like '*claude_rtl_patch.ps1*' })
+    } catch { return $false }
+}
+
+function Invoke-IdleCheck {
+    $reg = Get-RegisteredClaude
+    if (-not $reg) { return }
+    $procs = Get-DesktopClaude
+    $paths = @($procs | ForEach-Object { $_.Path })
+    $patchedVer = Get-PatchedVer
+    # One idle-triggered attempt per version per watcher run: a patch that keeps
+    # failing must not kill a running Claude every minute. Launches retry as before.
+    $allowed = [bool]($patchedVer -and $reg.Version -gt $patchedVer -and $paths.Count -gt 0 -and
+        -not $script:PatchAttempted.ContainsKey("$($reg.Version)") -and -not (Test-PatchRunning))
+    $d = Get-TickDecision -Registered $reg -ProcPaths $paths -PatchedVer $patchedVer -PatchAllowed $allowed
+
+    if ($d.Patch) {
+        Write-WLog "Idle check: Claude v$($reg.Version) is registered and running, patched is v$patchedVer -- re-patching."
+        Invoke-AutoPatch -newVer $reg.Version -exePath (Join-Path $reg.InstallLocation 'app\Claude.exe')
+        return
+    }
+    if ($d.Stale.Count -eq 0) { return }
+
+    $stale = @($procs | Where-Object { $d.Stale -contains $_.Path })
+    Write-WLogOnce 'stale' "Idle check: claude.exe still running from a replaced package (registered: v$($reg.Version)) -- ending PID $($stale.Id -join ', '): $(($d.Stale | Select-Object -Unique) -join '; ')"
+    $stale | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    # A survivor would swallow the relaunch again: don't launch or toast every minute.
+    $left = @(Get-DesktopClaude | Where-Object { $d.Stale -contains $_.Path })
+    if ($left.Count -gt 0) {
+        Write-WLogOnce 'stale-left' "Could not end PID $($left.Id -join ', '); not relaunching. Signing out and back in clears it."
+        return
+    }
+    if (-not $d.Relaunch) { return }
+    try {
+        Start-Process "shell:AppsFolder\$($reg.Aumid)" -ErrorAction Stop
+        Write-WLog "Relaunched Claude ($($reg.Aumid))."
+        Show-Toast "Claude restarted after an update" "A leftover process from the previous version was blocking Claude from reopening."
+    } catch {
+        Write-WLog "Relaunch failed: $($_.Exception.Message)"
+    }
+}
+
+$script:PatchAttempted = @{}
+$script:LoggedOnce     = @{}
+
 Write-WLog "Watcher started (PID $PID, user $env:USERNAME)"
 Write-WLog "Currently patched version: $(Get-PatchedVer)"
 
 # Initial sweep -- Claude may already be running a newer version at watcher start.
 try {
-    $existing = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+    $existing = Get-DesktopClaude | Select-Object -First 1
     if ($existing) { Test-AndPatch $existing.Path }
 } catch {}
 
 $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'claude.exe'"
 Register-CimIndicationEvent -Query $query -SourceIdentifier "ClaudeProcessCreated" | Out-Null
-Write-WLog "WMI subscription active. Idling..."
+Write-WLog "WMI subscription active; idle check every 60s."
 
+$lastIdleCheck = [DateTime]::MinValue
 while ($true) {
-    $ev = Wait-Event -SourceIdentifier "ClaudeProcessCreated" -Timeout 3600
-    if ($null -eq $ev) { continue }
-    try {
-        $p = $ev.SourceEventArgs.NewEvent.TargetInstance.ExecutablePath
-        Test-AndPatch $p
-    } catch {
-        Write-WLog "Event handler error: $($_.Exception.Message)"
-    } finally {
-        Remove-Event -EventIdentifier $ev.EventIdentifier
+    $ev = Wait-Event -SourceIdentifier "ClaudeProcessCreated" -Timeout 60
+    if ($null -ne $ev) {
+        try {
+            $p = $ev.SourceEventArgs.NewEvent.TargetInstance.ExecutablePath
+            Test-AndPatch $p
+        } catch {
+            Write-WLog "Event handler error: $($_.Exception.Message)"
+        } finally {
+            Remove-Event -EventIdentifier $ev.EventIdentifier
+        }
+    }
+    # A Claude launch raises one event per helper process, so gate on elapsed time.
+    if (((Get-Date) - $lastIdleCheck).TotalSeconds -ge 60) {
+        $lastIdleCheck = Get-Date
+        try { Invoke-IdleCheck } catch { Write-WLog "Idle check error: $($_.Exception.Message)" }
     }
 }
 '@
@@ -2689,6 +2821,12 @@ function Install-AutoUpdateTask {
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherPath`""
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $userName
+        # Re-fire every 15 min for the rest of the session. IgnoreNew makes it a no-op
+        # while the watcher runs; if the watcher died (seen: killed during logon with
+        # 0xC000013A), it comes back without waiting for the next logon.
+        $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Minutes 15)).Repetition
+        $trigger.Repetition.StopAtDurationEnd = $false
         $settings  = New-ScheduledTaskSettingsSet `
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
             -MultipleInstances IgnoreNew -StartWhenAvailable `
@@ -3275,18 +3413,25 @@ function Install-Patch {
         } else {
             # Auto-mode upgrade: re-register the watcher when the installed task predates
             # the on-disk format -- catches legacy -EncodedCommand watchers (Defender's
-            # Goptaju flag) and installs missing the pubkey pin.
+            # Goptaju flag), installs missing the pubkey pin, and watchers older than
+            # $global:RtlWatcherFormat (auto re-patches never rewrite watcher.ps1 otherwise).
+            # The running watcher keeps its old body until it restarts (next logon).
             try {
                 $existingTask = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
                 $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
+                $watcherFile = Join-Path $global:RtlStateDir 'watcher.ps1'
                 $needsUpgrade = $false
                 if ($existingTask) {
                     $argStr = ($existingTask.Actions | ForEach-Object { $_.Arguments }) -join ' '
                     if ($argStr -notmatch 'watcher\.ps1') { $needsUpgrade = $true }
+                    if (-not (Test-Path -LiteralPath $watcherFile) -or
+                        -not (Select-String -LiteralPath $watcherFile -Pattern "^# watcher-format: $global:RtlWatcherFormat\s*$" -Quiet)) {
+                        $needsUpgrade = $true
+                    }
                 }
                 if (-not (Test-Path $pinPath)) { $needsUpgrade = $true }
                 if ($existingTask -and $needsUpgrade) {
-                    Write-Log "Detected legacy/encoded watcher -- upgrading to on-disk watcher.ps1 silently."
+                    Write-Log "Detected legacy/outdated watcher -- re-registering it silently (format $global:RtlWatcherFormat)."
                     Install-AutoUpdateTask
                 }
             } catch {
