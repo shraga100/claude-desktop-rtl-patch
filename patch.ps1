@@ -1727,7 +1727,13 @@ function Stop-ClaudeServices {
     }
 
     foreach ($procName in @("claude", "cowork-svc")) {
-        $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        $procs = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
+        if ($procName -eq 'claude') {
+            # claude.exe is also the Claude Code CLI. Kill only the desktop app (MSIX
+            # folder) and the CLI copies it spawns under %APPDATA%\Claude; a standalone
+            # CLI (e.g. ~\.local\bin) in a terminal is left running. Unknown path: kill.
+            $procs = @($procs | Where-Object { -not $_.Path -or $_.Path -match '\\WindowsApps\\|\\Claude\\claude-code\\' })
+        }
         if ($procs) {
             Write-Log "Killing $($procs.Count) '$procName' process(es)..."
             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
