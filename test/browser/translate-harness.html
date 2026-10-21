@@ -1,0 +1,166 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Translate harness</title>
+<!--
+  Manual/automated browser harness for the DOM layer of src/translate.js.
+  Serve the repo root (e.g. `python -m http.server 8765`) and open
+  /test/browser/translate-harness.html ; results appear in #report and window.__results.
+  The transport is a mock that behaves like the real engine: it echoes every <iN> tag
+  with "TR(..)" around its text, REVERSES tag order, and keeps notranslate spans.
+-->
+<style>
+  body { font: 14px system-ui; margin: 16px; }
+  #spacer { height: 4000px; }
+  pre { background: #eee; padding: 6px; }
+  #report { white-space: pre-wrap; font: 12px monospace; background: #ffd; padding: 8px; margin-top: 16px; }
+</style>
+
+<nav id="ui">
+  <button id="b1">Settings</button>
+  <button id="b2" title="Open the menu" aria-label="Menu">New chat</button>
+  <input id="inp" placeholder="Search everything">
+  <span id="n1">12345</span>
+  <a id="u1" href="#">https://example.com/path</a>
+</nav>
+
+<main id="chat">
+  <div class="font-claude-response" id="msg1">
+    <p id="p1">Open <strong>the settings page</strong> and click <em>Save</em> to apply changes.</p>
+    <p id="p2">Run <code>npm install</code> to install the package.</p>
+    <pre id="pre1">const x = "do not translate me";</pre>
+    <p id="p3">Total: <span data-rtl-island="1">$x^2$</span> units</p>
+    <ul><li id="li1">First item</li><li id="li2">First item</li></ul>
+  </div>
+  <div data-testid="user-message" id="msg2"><p id="p4">Please explain closures.</p></div>
+  <div id="editor" contenteditable="true"><p id="ed1">Typing in the editor</p></div>
+</main>
+
+<div id="spacer"></div>
+<div class="font-claude-response" id="far"><p id="pfar">Far away paragraph</p></div>
+
+<div id="report"></div>
+
+<script src="../../src/translate.js"></script>
+<script>
+(function () {
+  var results = window.__results = [];
+  var requests = window.__requests = [];
+  function check(name, cond, extra) { results.push({ name: name, ok: !!cond, extra: extra || '' }); }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  // Mock engine -------------------------------------------------------------
+  function mock(lang, queries) {
+    requests.push(queries.slice());
+    return Promise.resolve(queries.map(function (q) {
+      var tags = [], m, re = /<i(\d+)>([\s\S]*?)<\/i\1>/g;
+      while ((m = re.exec(q))) tags.push('<i' + m[1] + '>TR(' + m[2].trim() + ')</i' + m[1] + '>');
+      if (tags.length) return [tags.reverse().join(' '), 'en'];
+      if (/^TR\(/.test(q)) return [q, 'he'];
+      return ['TR(' + q + ')', 'en'];
+    }));
+  }
+
+  var storage = { d: {}, getItem: function (k) { return this.d[k] || null; }, setItem: function (k, v) { this.d[k] = v; } };
+  function make(scope) {
+    return createTranslator({ lang: 'he', scope: scope, transport: mock, storage: storage,
+      editorSel: '[contenteditable="true"]' });
+  }
+  var t = function (id) { return document.getElementById(id).textContent; };
+
+  async function run() {
+    var tr = make('ui');
+    tr.start();
+    await sleep(900);
+
+    // --- scope: interface only
+    check('ui: button translated', t('b1') === 'TR(Settings)', t('b1'));
+    check('ui: second button translated', t('b2') === 'TR(New chat)', t('b2'));
+    check('ui: title attr translated', document.getElementById('b2').title === 'TR(Open the menu)', document.getElementById('b2').title);
+    check('ui: aria-label translated', document.getElementById('b2').getAttribute('aria-label') === 'TR(Menu)');
+    check('ui: placeholder translated', document.getElementById('inp').placeholder === 'TR(Search everything)', document.getElementById('inp').placeholder);
+    check('ui: number untouched', t('n1') === '12345');
+    check('ui: url untouched', t('u1') === 'https://example.com/path');
+    check('ui: conversation untouched', t('p1').startsWith('Open the settings page'), t('p1'));
+    check('ui: user message untouched', t('p4') === 'Please explain closures.');
+    check('editor never touched', t('ed1') === 'Typing in the editor');
+    check('ui: off-screen content not requested', !requests.some(function (b) { return b.some(function (q) { return /Far away/.test(q); }); }));
+
+    // --- scope: everything (rescans through the cache)
+    var before = requests.length;
+    tr.setScope('all');
+    await sleep(1500);
+    var p1 = document.getElementById('p1');
+    check('all: inline block translated per node', p1.textContent.indexOf('TR(') >= 0 && p1.querySelector('strong').textContent === 'TR(the settings page)', p1.textContent);
+    check('all: inline element structure preserved', !!p1.querySelector('strong') && !!p1.querySelector('em'), p1.innerHTML);
+    check('all: whitespace between nodes preserved', /\)\s+$/.test(p1.firstChild.nodeValue) || /\s$/.test(p1.firstChild.nodeValue), JSON.stringify(p1.firstChild.nodeValue));
+    check('all: code kept verbatim', document.querySelector('#p2 code').textContent === 'npm install');
+    check('all: code sent as notranslate, not translated', requests.some(function (b) { return b.some(function (q) { return /<span class="notranslate">npm install<\/span>/.test(q); }); }));
+    check('all: pre untouched', t('pre1') === 'const x = "do not translate me";');
+    check('all: math island untouched', document.querySelector('#p3 [data-rtl-island]').textContent === '$x^2$');
+    check('all: user message translated', t('p4') === 'TR(Please explain closures.)', t('p4'));
+    check('all: editor still untouched', t('ed1') === 'Typing in the editor');
+    check('all: duplicate list items share one request',
+      requests.slice(before).reduce(function (n, b) { return n + b.filter(function (q) { return q === 'First item'; }).length; }, 0) === 1);
+    check('all: identical items both translated', t('li1') === 'TR(First item)' && t('li2') === 'TR(First item)');
+    check('all: still off-screen -> not requested', !requests.some(function (b) { return b.some(function (q) { return /Far away/.test(q); }); }));
+
+    // --- cache: switching scopes back and forth sends nothing new for known text
+    var n1 = requests.length;
+    tr.setScope('ui'); await sleep(600);
+    check('ui again: content restored', t('p1').startsWith('Open the settings page'), t('p1'));
+    tr.setScope('all'); await sleep(900);
+    check('cache: re-apply needed no new requests', requests.length === n1, requests.length + ' vs ' + n1);
+
+    // --- React-style update: new text written to the same node is re-translated
+    var node = document.getElementById('p4').firstChild;
+    node.nodeValue = 'A brand new question';
+    await sleep(1500);
+    check('update: new original text re-translated', t('p4') === 'TR(A brand new question)', t('p4'));
+
+    // --- streaming: a block that keeps changing is translated once, after it settles
+    var stream = document.createElement('p'); stream.id = 'pst';
+    var tn = document.createTextNode('Streaming'); stream.appendChild(tn);
+    document.getElementById('msg1').appendChild(stream);
+    var n2 = requests.length;
+    for (var i = 0; i < 6; i++) { tn.nodeValue += ' word' + i; await sleep(150); }
+    check('stream: nothing sent while still changing', requests.length === n2, requests.length + ' vs ' + n2);
+    await sleep(1600);
+    check('stream: translated after settling, exactly once',
+      requests.length === n2 + 1 && /^TR\(Streaming word0/.test(t('pst')), t('pst') + ' / ' + (requests.length - n2));
+
+    // --- scrolling brings the far block in
+    window.scrollTo(0, document.body.scrollHeight);
+    await sleep(1500);
+    check('scroll: far block requested once visible', t('pfar') === 'TR(Far away paragraph)', t('pfar'));
+
+    // --- toggle off restores everything; on again re-applies
+    tr.stop();
+    check('off: everything restored', t('b1') === 'Settings' && t('p4') === 'A brand new question' &&
+      document.getElementById('b2').title === 'Open the menu' && document.getElementById('inp').placeholder === 'Search everything',
+      t('b1') + ' | ' + t('p4'));
+    var n3 = requests.length;
+    window.scrollTo(0, 0);
+    tr.start(); await sleep(1200);
+    check('on again: re-applied from cache', t('b1') === 'TR(Settings)' && requests.length === n3, t('b1') + ' ' + (requests.length - n3));
+    tr.stop();
+
+    // --- failures back off and retry instead of looping or crashing
+    var calls = 0;
+    var flaky = createTranslator({ lang: 'he', scope: 'ui', storage: { getItem: function () { return null; }, setItem: function () {} },
+      editorSel: '[contenteditable="true"]',
+      transport: function (l, q) { calls++; return calls < 2 ? Promise.reject(new Error('boom')) : mock(l, q); } });
+    var fresh = document.createElement('button'); fresh.id = 'fl'; fresh.textContent = 'Flaky label';
+    document.getElementById('ui').appendChild(fresh);
+    flaky.start(); await sleep(4500);
+    check('failure: retried after backoff and translated', t('fl') === 'TR(Flaky label)' && calls >= 2, t('fl') + ' calls=' + calls);
+    flaky.stop();
+
+    var failed = results.filter(function (r) { return !r.ok; });
+    document.getElementById('report').textContent =
+      (failed.length ? 'FAILED ' + failed.length + ' / ' : 'ALL PASSED ') + results.length + '\n' +
+      results.map(function (r) { return (r.ok ? 'ok   ' : 'FAIL ') + r.name + (r.ok ? '' : '  -> ' + r.extra); }).join('\n');
+    window.__done = true;
+  }
+  run().catch(function (e) { document.getElementById('report').textContent = 'CRASH ' + e + '\n' + e.stack; window.__done = true; });
+})();
+</script>
