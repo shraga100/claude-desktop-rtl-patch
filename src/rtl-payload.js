@@ -38,6 +38,14 @@
         var CUSTOM_FONT_SCOPE = '__RTL_CUSTOM_FONT_SCOPE__';
         if (CUSTOM_FONT_SCOPE.indexOf('__') === 0) CUSTOM_FONT_SCOPE = 'arabic';
 
+        // Optional page translation (src/translate.js). patch.ps1 splices the target
+        // language ('' = off) and scope ('ui' = interface only, 'all' = interface and
+        // conversation); when it is off the translation code is not injected at all.
+        var TRANSLATE_TO = '__RTL_TRANSLATE_TO__';
+        if (TRANSLATE_TO.indexOf('__') === 0) TRANSLATE_TO = '';
+        var TRANSLATE_SCOPE = '__RTL_TRANSLATE_SCOPE__';
+        if (TRANSLATE_SCOPE.indexOf('__') === 0) TRANSLATE_SCOPE = 'ui';
+
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
         }
@@ -65,6 +73,9 @@
         // --- PURE DETECTION CORE (inlined from src/rtl-core.js by build-payload.ps1) ---
         /*__RTL_CORE__*/
         // --- END PURE DETECTION CORE ---
+
+        // --- OPTIONAL TRANSLATION LAYER (spliced in by patch.ps1 only when enabled) ---
+        /*__RTL_TRANSLATE_CODE__*/
 
         // Text of an element excluding <code>/<pre> children.
         function textWithoutCode(el) {
@@ -555,6 +566,11 @@
                 }
             }
             processAll();
+
+            if (TRANSLATE_TO && typeof startTranslation === 'function') {
+                try { startTranslation({ lang: TRANSLATE_TO, scope: TRANSLATE_SCOPE, editorSel: EDITOR_SEL }); }
+                catch (e) { console.error('[Claude RTL] translation', e); }
+            }
 
             // Input box live direction switching
             document.addEventListener('input', function(e) {
