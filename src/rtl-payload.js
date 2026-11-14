@@ -156,6 +156,47 @@
             return majorityDir(dirs);
         }
 
+        // An item's own text: no <code>/<pre>, and no nested sub-list (a sub-list's
+        // items are judged on their own).
+        function ownItemText(li) {
+            var out = '';
+            var nodes = li.childNodes;
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (n.nodeType === 3) { out += n.textContent; }
+                else if (n.nodeType === 1 && !/^(CODE|PRE|UL|OL)$/.test(n.tagName)) {
+                    out += ownItemText(n);
+                }
+            }
+            return out;
+        }
+
+        // Direction context of a list: its items decide (an item containing RTL votes
+        // rtl, see listContextDir); on a tie or no vote, a sub-list follows the item it
+        // is nested in.
+        function listContext(list) {
+            if (!list || !/^(UL|OL)$/.test(list.tagName)) return null;
+            var texts = [];
+            for (var i = 0; i < list.children.length; i++) {
+                if (list.children[i].tagName === 'LI') texts.push(ownItemText(list.children[i]));
+            }
+            var d = listContextDir(texts);
+            if (d) return d;
+            var parentItem = list.parentElement ? list.parentElement.closest('li') : null;
+            var host = parentItem ? parentItem.closest('[dir]') : null;
+            if (host && host !== document.documentElement && host !== document.body &&
+                    host.getAttribute('dir') === 'rtl') return 'rtl';
+            return null;
+        }
+
+        // detectElDir, plus list context for an <li>: a mostly-Latin item that holds
+        // RTL ("Review <Arabic> design system <Arabic> colors") inside an RTL list is RTL.
+        function resolveDir(el) {
+            var d = detectElDir(el);
+            if (el.tagName !== 'LI' || d === 'rtl') return d;
+            return listItemDir(ownItemText(el), d, listContext(el.parentElement));
+        }
+
         // For plain text (input box, dialogs without DOM structure).
         function detectTextDir(text) {
             if (!text || !text.trim()) return null;
@@ -311,7 +352,7 @@
                     if (hasRTL(el.textContent || '') && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                     } else if (el.getAttribute('dir') !== 'rtl' &&
-                               detectElDir(el) === 'rtl') {
+                               resolveDir(el) === 'rtl') {
                         // Disagreement (code-prefixed or Latin-first Hebrew): override.
                         stampDir(el, 'rtl');
                     }
@@ -320,7 +361,7 @@
                     }
                     return;
                 }
-                var dir = detectElDir(el);
+                var dir = resolveDir(el);
                 if (dir) {
                     if (dir === 'rtl' && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
@@ -349,14 +390,16 @@
                     // Native judges a list by its FIRST item only. Overrule ltr only on a
                     // confident majority of item dirs.
                     if (el.getAttribute('dir') !== 'rtl' &&
-                            listConfidentDir(el) === 'rtl') {
+                            (listConfidentDir(el) === 'rtl' || listContext(el) === 'rtl')) {
                         stampDir(el, 'rtl');
                         var npl = getComputedStyle(el).paddingLeft;
                         if (parseFloat(npl) > 0) { el.style.paddingRight = npl; el.style.paddingLeft = '0'; }
                     }
                     return;
                 }
-                var dir = detectElDir(el);
+                // A sub-list whose items are mostly Latin letters but each holds RTL
+                // reads as one RTL list, not item by item (whole-text majority says LTR).
+                var dir = listContext(el) === 'rtl' ? 'rtl' : detectElDir(el);
                 if (dir === 'rtl') {
                     stampDir(el, 'rtl');
                     var pl = getComputedStyle(el).paddingLeft;

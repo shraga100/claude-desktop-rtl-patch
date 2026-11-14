@@ -434,6 +434,32 @@ function majorityDir(dirs) {
     if (l > r) return 'ltr';
     return null;
 }
+
+// --- LIST CONTEXT ---
+// A list item is judged in the context of its list. Hebrew/Arabic writers mix in
+// English terms freely ("Review [Hebrew/Arabic: the] design system [and update the]
+// colors"): such an item can open with a Latin word AND hold more Latin letters than
+// RTL ones, so first-strong and rtlMajority both call it LTR. Inside an RTL list it
+// is still an RTL sentence. Like cellDir for tables, an item that CONTAINS RTL inside
+// an RTL list context is RTL; items with no RTL letters keep their own direction.
+
+// Context direction of a list from its items' own texts (nested sub-lists excluded).
+// Votes like cellDir: an item containing RTL votes 'rtl', a Latin-first item without
+// RTL votes 'ltr', neutral items abstain.
+function listContextDir(itemTexts) {
+    var dirs = [];
+    for (var i = 0; i < (itemTexts || []).length; i++) dirs.push(cellDir(itemTexts[i]));
+    return majorityDir(dirs);
+}
+
+// Direction for one list item. `ownDir` is the item's standalone detection ('rtl',
+// 'ltr' or null); `contextDir` is the list's context ('rtl' from an RTL parent item
+// or an RTL-majority list). Returns 'rtl' or the standalone result unchanged.
+function listItemDir(text, ownDir, contextDir) {
+    if (ownDir === 'rtl') return 'rtl';
+    if (contextDir === 'rtl' && hasRTL(text)) return 'rtl';
+    return ownDir;
+}
         // --- END PURE DETECTION CORE ---
 
         // Text of an element excluding <code>/<pre> children.
@@ -524,6 +550,47 @@ function majorityDir(dirs) {
                 dirs.push(d || null);
             }
             return majorityDir(dirs);
+        }
+
+        // An item's own text: no <code>/<pre>, and no nested sub-list (a sub-list's
+        // items are judged on their own).
+        function ownItemText(li) {
+            var out = '';
+            var nodes = li.childNodes;
+            for (var i = 0; i < nodes.length; i++) {
+                var n = nodes[i];
+                if (n.nodeType === 3) { out += n.textContent; }
+                else if (n.nodeType === 1 && !/^(CODE|PRE|UL|OL)$/.test(n.tagName)) {
+                    out += ownItemText(n);
+                }
+            }
+            return out;
+        }
+
+        // Direction context of a list: its items decide (an item containing RTL votes
+        // rtl, see listContextDir); on a tie or no vote, a sub-list follows the item it
+        // is nested in.
+        function listContext(list) {
+            if (!list || !/^(UL|OL)$/.test(list.tagName)) return null;
+            var texts = [];
+            for (var i = 0; i < list.children.length; i++) {
+                if (list.children[i].tagName === 'LI') texts.push(ownItemText(list.children[i]));
+            }
+            var d = listContextDir(texts);
+            if (d) return d;
+            var parentItem = list.parentElement ? list.parentElement.closest('li') : null;
+            var host = parentItem ? parentItem.closest('[dir]') : null;
+            if (host && host !== document.documentElement && host !== document.body &&
+                    host.getAttribute('dir') === 'rtl') return 'rtl';
+            return null;
+        }
+
+        // detectElDir, plus list context for an <li>: a mostly-Latin item that holds
+        // RTL ("Review <Arabic> design system <Arabic> colors") inside an RTL list is RTL.
+        function resolveDir(el) {
+            var d = detectElDir(el);
+            if (el.tagName !== 'LI' || d === 'rtl') return d;
+            return listItemDir(ownItemText(el), d, listContext(el.parentElement));
         }
 
         // For plain text (input box, dialogs without DOM structure).
@@ -681,7 +748,7 @@ function majorityDir(dirs) {
                     if (hasRTL(el.textContent || '') && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                     } else if (el.getAttribute('dir') !== 'rtl' &&
-                               detectElDir(el) === 'rtl') {
+                               resolveDir(el) === 'rtl') {
                         // Disagreement (code-prefixed or Latin-first Hebrew): override.
                         stampDir(el, 'rtl');
                     }
@@ -690,7 +757,7 @@ function majorityDir(dirs) {
                     }
                     return;
                 }
-                var dir = detectElDir(el);
+                var dir = resolveDir(el);
                 if (dir) {
                     if (dir === 'rtl' && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
@@ -719,14 +786,16 @@ function majorityDir(dirs) {
                     // Native judges a list by its FIRST item only. Overrule ltr only on a
                     // confident majority of item dirs.
                     if (el.getAttribute('dir') !== 'rtl' &&
-                            listConfidentDir(el) === 'rtl') {
+                            (listConfidentDir(el) === 'rtl' || listContext(el) === 'rtl')) {
                         stampDir(el, 'rtl');
                         var npl = getComputedStyle(el).paddingLeft;
                         if (parseFloat(npl) > 0) { el.style.paddingRight = npl; el.style.paddingLeft = '0'; }
                     }
                     return;
                 }
-                var dir = detectElDir(el);
+                // A sub-list whose items are mostly Latin letters but each holds RTL
+                // reads as one RTL list, not item by item (whole-text majority says LTR).
+                var dir = listContext(el) === 'rtl' ? 'rtl' : detectElDir(el);
                 if (dir === 'rtl') {
                     stampDir(el, 'rtl');
                     var pl = getComputedStyle(el).paddingLeft;
@@ -2498,6 +2567,39 @@ function Take-Ownership($Path) {
     cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:(OI)(CI)F`" /T /Q >nul 2>&1"
 }
 
+function Remove-StaleRtlRootCerts {
+    <#
+    .SYNOPSIS
+        Removes every 'Claude_RTL_SelfSigned' certificate from LocalMachine\Root (and any
+        leftover in LocalMachine\My) except -KeepThumbprint, destroying linked private keys
+        first. Never throws: a failed sweep must not fail an otherwise good patch.
+    #>
+    param([Parameter(Mandatory)][string]$KeepThumbprint)
+
+    foreach ($storeName in @('Root', 'My')) {
+        $st = $null
+        try {
+            $st = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+            $st.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $stale = @($st.Certificates | Where-Object {
+                $_.FriendlyName -eq 'Claude_RTL_SelfSigned' -and $_.Thumbprint -ne $KeepThumbprint
+            })
+            foreach ($old in $stale) {
+                $null = Remove-CertPrivateKey -Cert $old
+                $st.Remove($old)
+                Write-Log "Removed stale Claude_RTL_SelfSigned cert from $storeName ($($old.Thumbprint))."
+            }
+            if ($stale.Count -gt 0) {
+                Write-Success "Removed $($stale.Count) old self-signed certificate(s) from $storeName."
+            }
+        } catch {
+            Write-Warn "Could not sweep old certificates from ${storeName}: $($_.Exception.Message)"
+        } finally {
+            if ($st) { $st.Close() }
+        }
+    }
+}
+
 function Remove-CertPrivateKey {
     <#
     .SYNOPSIS
@@ -3388,7 +3490,13 @@ function Install-PatchCore {
                 $NewCertBytes = $Cert.RawData
 
                 if ($NewCertBytes.Length -le $OldCertSize) {
-                    $Store.Add($Cert)
+                    # Trust a PUBLIC-ONLY copy. Adding $Cert itself also copies its
+                    # key-provider link into Root, so the Root entry keeps reporting
+                    # HasPrivateKey=True ("Missing stored keyset") even after the wipe
+                    # below has destroyed the key -- which reads as a live key (issue #45).
+                    $RootCopy = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$NewCertBytes)
+                    $RootCopy.FriendlyName = "Claude_RTL_SelfSigned"
+                    $Store.Add($RootCopy)
                     $ValidCertFound = $true
                     Write-Success "Generated certificate fits! ($($Config.Label), Size: $($NewCertBytes.Length) bytes, Hole: $OldCertSize bytes)"
                     break
@@ -3519,6 +3627,12 @@ function Install-PatchCore {
                 Write-Host "    'Claude_RTL_SelfSigned' certificate and its key container." -ForegroundColor Cyan
                 Write-Host ""
             }
+
+            # SWEEP OLD TRUST ANCHORS (issue #45): every patch run adds a new Root cert,
+            # and only restore removed the old ones, so one piled up per Claude update.
+            # Both binaries are now signed by $Cert, so every other Claude_RTL_SelfSigned
+            # Root entry is dead weight: destroy any key it still links to, then remove it.
+            Remove-StaleRtlRootCerts -KeepThumbprint $Cert.Thumbprint
 
         } else {
             Write-Warn "claude.exe or cowork-svc.exe not found. Binary patching skipped."

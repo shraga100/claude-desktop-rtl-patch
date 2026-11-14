@@ -285,6 +285,32 @@ function majorityDir(dirs) {
     return null;
 }
 
+// --- LIST CONTEXT ---
+// A list item is judged in the context of its list. Hebrew/Arabic writers mix in
+// English terms freely ("Review [Hebrew/Arabic: the] design system [and update the]
+// colors"): such an item can open with a Latin word AND hold more Latin letters than
+// RTL ones, so first-strong and rtlMajority both call it LTR. Inside an RTL list it
+// is still an RTL sentence. Like cellDir for tables, an item that CONTAINS RTL inside
+// an RTL list context is RTL; items with no RTL letters keep their own direction.
+
+// Context direction of a list from its items' own texts (nested sub-lists excluded).
+// Votes like cellDir: an item containing RTL votes 'rtl', a Latin-first item without
+// RTL votes 'ltr', neutral items abstain.
+function listContextDir(itemTexts) {
+    var dirs = [];
+    for (var i = 0; i < (itemTexts || []).length; i++) dirs.push(cellDir(itemTexts[i]));
+    return majorityDir(dirs);
+}
+
+// Direction for one list item. `ownDir` is the item's standalone detection ('rtl',
+// 'ltr' or null); `contextDir` is the list's context ('rtl' from an RTL parent item
+// or an RTL-majority list). Returns 'rtl' or the standalone result unchanged.
+function listItemDir(text, ownDir, contextDir) {
+    if (ownDir === 'rtl') return 'rtl';
+    if (contextDir === 'rtl' && hasRTL(text)) return 'rtl';
+    return ownDir;
+}
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         RTL_RANGES: RTL_RANGES,
@@ -300,6 +326,8 @@ if (typeof module !== 'undefined' && module.exports) {
         segmentText: segmentText,
         cellDir: cellDir,
         tableDirFromCells: tableDirFromCells,
-        majorityDir: majorityDir
+        majorityDir: majorityDir,
+        listContextDir: listContextDir,
+        listItemDir: listItemDir
     };
 }

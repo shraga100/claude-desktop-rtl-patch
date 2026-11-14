@@ -210,3 +210,40 @@ test('segmentText still returns single segment for currency-only text (regressio
     assert.strictEqual(segs.length, 1);
     assert.strictEqual(segs[0].type, 'text');
 });
+
+// --- List context (nested lists that mix Arabic/Hebrew with English terms) ---
+
+test('listContextDir: items holding RTL vote rtl even when Latin-heavy', () => {
+    const items = [
+        'Review الـ design system وتحديث الـ colors',
+        'كتابة الـ documentation للـ components',
+        'Fix bug في الـ login page (Safari فقط)',
+    ];
+    assert.strictEqual(core.listContextDir(items), 'rtl');
+});
+
+test('listContextDir: an English list quoting one RTL word stays ltr', () => {
+    const items = ['Install the package', 'Run the tests', 'Say שלום to the team'];
+    assert.strictEqual(core.listContextDir(items), 'ltr');
+});
+
+test('listContextDir: neutral items abstain; empty list has no context', () => {
+    assert.strictEqual(core.listContextDir(['123', '---']), null);
+    assert.strictEqual(core.listContextDir([]), null);
+});
+
+test('listItemDir: Latin-heavy RTL item follows an RTL list context', () => {
+    const t = 'Review الـ design system وتحديث الـ colors';
+    // Standalone detection says ltr: first strong is Latin AND Latin letters outnumber RTL.
+    assert.strictEqual(core.firstStrong(t), 'ltr');
+    assert.strictEqual(core.rtlMajority(t), false);
+    assert.strictEqual(core.listItemDir(t, null, 'rtl'), 'rtl');
+});
+
+test('listItemDir: no RTL letters, or no RTL context, keeps standalone direction', () => {
+    assert.strictEqual(core.listItemDir('Fix the login page', 'ltr', 'rtl'), 'ltr');
+    assert.strictEqual(core.listItemDir('Fix the login page', null, 'rtl'), null);
+    assert.strictEqual(core.listItemDir('Say שלום to the team', null, 'ltr'), null);
+    assert.strictEqual(core.listItemDir('Say שלום to the team', null, null), null);
+    assert.strictEqual(core.listItemDir('שלום', 'rtl', 'ltr'), 'rtl');
+});
