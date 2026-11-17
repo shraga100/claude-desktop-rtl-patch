@@ -1430,7 +1430,7 @@ function Write-LogToFile($level, $msg) {
 }
 
 function Write-Log($msg)     { Write-Host "  [*] $msg" -ForegroundColor Cyan;    Write-LogToFile 'INFO' $msg }
-function Write-Step($msg)    { Write-Host "`n► $msg" -ForegroundColor Magenta;   Write-LogToFile 'STEP' $msg }
+function Write-Step($msg)    { Write-Host "`n$([char]0x25BA) $msg" -ForegroundColor Magenta;   Write-LogToFile 'STEP' $msg }
 function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green;   Write-LogToFile 'OK'   $msg }
 function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow;  Write-LogToFile 'WARN' $msg }
 
@@ -3881,9 +3881,13 @@ function Restore-Patch {
 # -----------------------------------------------------------------------------
 function Show-Menu {
     Clear-Host
-    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║    Claude Desktop Smart RTL & Service Patcher    ║" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    # Box-drawing chars are built from code points: patch.ps1 must stay pure ASCII,
+    # since PS 5.1 reads a BOM-less script in the system code page.
+    $bar = [string][char]0x2550 * 50
+    $v   = [string][char]0x2551
+    Write-Host "$([char]0x2554)$bar$([char]0x2557)" -ForegroundColor Cyan
+    Write-Host "$v    Claude Desktop Smart RTL & Service Patcher    $v" -ForegroundColor Cyan
+    Write-Host "$([char]0x255A)$bar$([char]0x255D)" -ForegroundColor Cyan
     # Color language: green = the main action, yellow = undo, white = everything
     # else, dark gray = exit. Section headers group the options by purpose.
     Write-Host ""

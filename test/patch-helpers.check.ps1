@@ -20,9 +20,9 @@ function Assert($cond, [string]$msg) {
 }
 
 $tokens = $null; $errs = $null
-# Parse the text as UTF-8, the way patch.ps1 actually runs (installers write it with a
-# BOM). ParseFile would read the BOM-less file as ANSI and trip on its payload text.
-$ast = [System.Management.Automation.Language.Parser]::ParseInput([IO.File]::ReadAllText($patchPath), [ref]$tokens, [ref]$errs)
+# ParseFile reads the BOM-less file the way `powershell -File patch.ps1` does (system
+# ANSI code page), so this also proves a direct run from the repo parses.
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($patchPath, [ref]$tokens, [ref]$errs)
 Write-Host "patch.ps1 parse"
 Assert ($errs.Count -eq 0) "patch.ps1 parses without errors ($($errs.Count))"
 
