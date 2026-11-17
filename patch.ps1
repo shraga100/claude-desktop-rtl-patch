@@ -1434,6 +1434,32 @@ function Write-Step($msg)    { Write-Host "`n► $msg" -ForegroundColor Magenta;
 function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green;   Write-LogToFile 'OK'   $msg }
 function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow;  Write-LogToFile 'WARN' $msg }
 
+# File offset where a PE's Authenticode signature (the security data directory)
+# begins, or the file length when there is none or the headers look wrong (#48).
+# The security entry holds a FILE offset, not an RVA.
+function Get-PeSecurityDirOffset([byte[]]$Bytes) {
+    if ($Bytes -eq $null) { return 0 }
+    $len = $Bytes.Length
+    try {
+        if ($len -lt 0x40 -or $Bytes[0] -ne 0x4D -or $Bytes[1] -ne 0x5A) { return $len }
+        $pe = [BitConverter]::ToInt32($Bytes, 0x3C)
+        if ($pe -le 0 -or ($pe + 24 + 2) -gt $len) { return $len }
+        if ($Bytes[$pe] -ne 0x50 -or $Bytes[$pe+1] -ne 0x45 -or $Bytes[$pe+2] -ne 0 -or $Bytes[$pe+3] -ne 0) { return $len }
+        $magic = [BitConverter]::ToUInt16($Bytes, $pe + 24)
+        if ($magic -eq 0x20b)     { $dd = $pe + 24 + 112 }
+        elseif ($magic -eq 0x10b) { $dd = $pe + 24 + 96 }
+        else { return $len }
+        $entry = $dd + 4 * 8
+        if (($entry + 8) -gt $len) { return $len }
+        $off  = [long][BitConverter]::ToUInt32($Bytes, $entry)
+        $size = [long][BitConverter]::ToUInt32($Bytes, $entry + 4)
+        if ($off -le 0 -or $size -le 0 -or ($off + $size) -gt $len) { return $len }
+        return [int]$off
+    } catch {
+        return $len
+    }
+}
+
 # Pure Binary Search equivalent to Python's bytearray.find().
 function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
     # Fast path: convert both arrays to byte-preserving ISO-8859-1 strings and delegate
@@ -1993,8 +2019,24 @@ Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.e
     }
 }
 
+# Picks one package from candidates that match '*Claude*' (#45): the direct-download
+# package is named exactly 'Claude'; any other match (e.g. a separately listed Store
+# package) is used only when that one is absent. One candidate -> returned as-is.
+function Select-ClaudePackage {
+    param($Packages)
+    $all = @($Packages | Where-Object { $_ })
+    if ($all.Count -eq 0) { return $null }
+    $pick = $all | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1
+    if (-not $pick) { $pick = $all[0] }
+    if ($all.Count -gt 1) {
+        $list = ($all | ForEach-Object { "$($_.Name) $($_.Version)" }) -join ', '
+        Write-Log "Multiple Claude packages found ($list); using $($pick.Name) $($pick.Version)."
+    }
+    return $pick
+}
+
 function Find-ClaudeDir {
-    $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
+    $pkg = Select-ClaudePackage (Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' })
     if (-not $pkg) {
         # UAC elevation can switch identity: elevating with a separate admin account
         # hides Claude registered to the invoking user (#34). -AllUsers (needs admin,
@@ -2002,10 +2044,9 @@ function Find-ClaudeDir {
         Try {
             # SilentlyContinue: orphaned packages from deleted profiles emit per-entry
             # errors that would abort the pipeline under ErrorActionPreference = Stop.
-            $pkg = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+            $pkg = Select-ClaudePackage (Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' -and (Test-Path $_.InstallLocation) } |
-                Sort-Object -Property { [version]$_.Version } -Descending |
-                Select-Object -First 1
+                Sort-Object -Property { [version]$_.Version } -Descending)
             if ($pkg) { Write-Log "Claude package found via -AllUsers fallback (registered to another user account)." }
             else      { Write-Log "-AllUsers fallback ran but found no Claude package either." }
         } Catch {
@@ -2063,7 +2104,16 @@ function Stop-ClaudeServices {
     }
 
     foreach ($procName in @("claude", "cowork-svc")) {
-        $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        $procs = @(Get-Process -Name $procName -ErrorAction SilentlyContinue)
+        if ($procName -eq 'claude') {
+            # claude.exe is also the Claude Code CLI. Stop the desktop app (WindowsApps)
+            # and the CLI copies it runs (...\claude-code\...); leave a standalone CLI
+            # (e.g. ~\.local\bin\claude.exe) running. Unreadable path: stop it.
+            $all = $procs
+            $procs = @($all | Where-Object { -not $_.Path -or $_.Path -match '\\WindowsApps\\|\\claude-code\\' })
+            $kept = $all.Count - $procs.Count
+            if ($kept -gt 0) { Write-Log "Leaving $kept standalone Claude Code CLI process(es) running." }
+        }
         if ($procs) {
             Write-Log "Killing $($procs.Count) '$procName' process(es)..."
             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -2475,7 +2525,7 @@ function Start-ClaudeServices {
 
     Write-Log "Launching Claude Desktop..."
     Try {
-        $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' } | Select-Object -First 1
+        $pkg = Select-ClaudePackage (Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' })
         if ($pkg) {
             $appId = "$($pkg.PackageFamilyName)!Claude"
             Start-Process "shell:AppsFolder\$appId" -ErrorAction Stop
@@ -2496,6 +2546,46 @@ function Take-Ownership($Path) {
     Write-Log "Requesting permissions for: $Path"
     cmd.exe /c "takeown /F `"$Path`" /R /D Y >nul 2>&1"
     cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:(OI)(CI)F`" /T /Q >nul 2>&1"
+}
+
+function Remove-StaleRtlCerts {
+    <#
+    .SYNOPSIS
+        Removes every 'Claude_RTL_SelfSigned' certificate from LocalMachine\Root and
+        LocalMachine\My except -KeepThumbprint (#45). Each run trusts a new cert, and
+        before this only restore/rollback removed the old ones, so one piled up per
+        Claude update. Any private key still linked is destroyed first. Never throws:
+        a failed sweep must not fail (or roll back) an otherwise good patch.
+    #>
+    param([Parameter(Mandatory)][string]$KeepThumbprint)
+
+    foreach ($storeName in @('Root', 'My')) {
+        $st = $null
+        try {
+            $st = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, "LocalMachine")
+            $st.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $stale = @($st.Certificates | Where-Object {
+                $_.FriendlyName -eq 'Claude_RTL_SelfSigned' -and $_.Thumbprint -ne $KeepThumbprint
+            })
+            $removed = 0
+            foreach ($old in $stale) {
+                try {
+                    $null = Remove-CertPrivateKey -Cert $old
+                    $st.Remove($old)
+                    $removed++
+                } catch {
+                    Write-Log "Could not remove old certificate $($old.Thumbprint) from ${storeName}: $($_.Exception.Message)"
+                }
+            }
+            if ($removed -gt 0) {
+                Write-Success "Removed $removed old Claude_RTL_SelfSigned certificate(s) from LocalMachine\$storeName."
+            }
+        } catch {
+            Write-Warn "Could not sweep old certificates from LocalMachine\${storeName}: $($_.Exception.Message)"
+        } finally {
+            if ($st) { $st.Close() }
+        }
+    }
 }
 
 function Remove-CertPrivateKey {
@@ -3321,15 +3411,22 @@ function Install-PatchCore {
             $OldCertSize = 0
             $Offset = 0
 
+            # Search only the image body. The file's own Authenticode signature also
+            # holds "Anthropic, PBC" certs; overwriting one of those corrupts the
+            # signature and makes the re-sign below fail (#48). Re-signing replaces
+            # that blob anyway, so a match there is never a cert worth swapping.
+            $SigStart = Get-PeSecurityDirOffset $SvcBytes
+            Write-Log "cowork-svc.exe signature starts at $([Convert]::ToString($SigStart, 16)) (file size $([Convert]::ToString($SvcBytes.Length, 16)))."
+
             while ($true) {
                 $AnchorPos = Find-Bytes -Haystack $SvcBytes -Needle $AnchorBytes -StartIndex $Offset
-                if ($AnchorPos -eq -1) { break }
+                if ($AnchorPos -eq -1 -or $AnchorPos -ge $SigStart) { break }
 
                 $Limit = [Math]::Max(0, $AnchorPos - 2000)
                 for ($i = $AnchorPos; $i -ge $Limit; $i--) {
                     if ($SvcBytes[$i] -eq 0x30 -and $SvcBytes[$i+1] -eq 0x82) {
                         $TotalSize = 4 + (([int]$SvcBytes[$i+2] -shl 8) -bor [int]$SvcBytes[$i+3])
-                        if ($TotalSize -gt 500 -and $TotalSize -lt 4000 -and $i -lt $AnchorPos -and ($i + $TotalSize) -gt $AnchorPos) {
+                        if ($TotalSize -gt 500 -and $TotalSize -lt 4000 -and $i -lt $AnchorPos -and ($i + $TotalSize) -gt $AnchorPos -and ($i + $TotalSize) -le $SigStart) {
                             $StartPos = $i
                             $OldCertSize = $TotalSize
                             break
@@ -3341,10 +3438,10 @@ function Install-PatchCore {
             }
 
             if ($StartPos -eq -1) {
-                throw "Anthropic certificate pattern not found in cowork-svc.exe. Binary patch aborted."
+                Write-Log "No embedded certificate outside the Authenticode signature in cowork-svc.exe; skipping the byte swap (re-sign only)."
+            } else {
+                Write-Log "Target cowork-svc hole found at $([Convert]::ToString($StartPos, 16)) (Size: $OldCertSize bytes)."
             }
-
-            Write-Log "Target cowork-svc hole found at $([Convert]::ToString($StartPos, 16)) (Size: $OldCertSize bytes)."
 
             # Log the original subject but DON'T clone it: its SERIALNUMBER + jurisdiction
             # OID fields bloat the DER cert (~1136 bytes) past the hole. Pin a compact
@@ -3387,10 +3484,11 @@ function Install-PatchCore {
 
                 $NewCertBytes = $Cert.RawData
 
-                if ($NewCertBytes.Length -le $OldCertSize) {
+                if ($StartPos -lt 0 -or $NewCertBytes.Length -le $OldCertSize) {
                     $Store.Add($Cert)
                     $ValidCertFound = $true
-                    Write-Success "Generated certificate fits! ($($Config.Label), Size: $($NewCertBytes.Length) bytes, Hole: $OldCertSize bytes)"
+                    $HoleNote = if ($StartPos -lt 0) { "no hole to fit" } else { "Hole: $OldCertSize bytes" }
+                    Write-Success "Generated certificate fits! ($($Config.Label), Size: $($NewCertBytes.Length) bytes, $HoleNote)"
                     break
                 } else {
                     Write-Warn "Certificate too large ($($Config.Label): $($NewCertBytes.Length) bytes > $OldCertSize). Removing and trying a smaller key..."
@@ -3455,15 +3553,20 @@ function Install-PatchCore {
             else { throw "Re-signing claude.exe failed: $($SignResult.Status)" }
 
             Wait-FileUnlock $CoworkSvcPath
-            $Diff = $OldCertSize - $NewCertBytes.Length
-            Write-Log "Swapping cowork-svc cert and padding with $Diff bytes of 0x00..."
+            if ($StartPos -ge 0) {
+                $Diff = $OldCertSize - $NewCertBytes.Length
+                Write-Log "Swapping cowork-svc cert and padding with $Diff bytes of 0x00..."
 
-            $PaddedCert = New-Object byte[] $OldCertSize
-            [Array]::Copy($NewCertBytes, 0, $PaddedCert, 0, $NewCertBytes.Length)
+                $PaddedCert = New-Object byte[] $OldCertSize
+                [Array]::Copy($NewCertBytes, 0, $PaddedCert, 0, $NewCertBytes.Length)
 
-            [Array]::Copy($PaddedCert, 0, $SvcBytes, $StartPos, $OldCertSize)
+                [Array]::Copy($PaddedCert, 0, $SvcBytes, $StartPos, $OldCertSize)
+            }
+            # Written in both cases: the source is the original (.bak), so every run
+            # starts from Anthropic's binary and the re-sign below is idempotent.
             [System.IO.File]::WriteAllBytes($CoworkSvcPath, $SvcBytes)
-            Write-Success "Binary cert replacement completed in cowork-svc.exe"
+            if ($StartPos -ge 0) { Write-Success "Binary cert replacement completed in cowork-svc.exe" }
+            else { Write-Log "cowork-svc.exe restored from the original bytes (no embedded cert to swap)." }
 
             Write-Log "Re-signing cowork-svc.exe with self-signed certificate (this can take several seconds)..."
             $SignResult2 = Set-AuthenticodeSignature -FilePath $CoworkSvcPath -Certificate $Cert -HashAlgorithm SHA256
@@ -3519,6 +3622,10 @@ function Install-PatchCore {
                 Write-Host "    'Claude_RTL_SelfSigned' certificate and its key container." -ForegroundColor Cyan
                 Write-Host ""
             }
+
+            # Both binaries are now signed by $Cert, so every other Claude_RTL_SelfSigned
+            # trust anchor is dead weight (#45). Runs only after both re-signs succeeded.
+            Remove-StaleRtlCerts -KeepThumbprint $Cert.Thumbprint
 
         } else {
             Write-Warn "claude.exe or cowork-svc.exe not found. Binary patching skipped."
