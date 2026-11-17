@@ -270,5 +270,20 @@ try {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- QuickEdit off in auto mode ----------------------------------------------------
+Write-Host "`nAuto-mode console"
+$autoBlock = [regex]::Match([IO.File]::ReadAllText($patchPath), '(?s)\nif \(\$Auto\) \{(.*?)\n\} else \{').Groups[1].Value
+$offIdx  = $autoBlock.IndexOf('Set-ConsoleQuickEdit $false')
+$hostIdx = $autoBlock.IndexOf('Write-Host')
+$restIdx = $autoBlock.IndexOf('Set-ConsoleQuickEdit $true $savedConsoleMode')
+$readIdx = $autoBlock.IndexOf('Read-Host')
+Assert ($offIdx -ge 0 -and $offIdx -lt $hostIdx) 'QuickEdit is turned off before the first console write'
+Assert ($restIdx -gt $offIdx -and $restIdx -lt $readIdx) "the user's console mode is restored before the final prompt"
+Import-PatchFunction 'Set-ConsoleQuickEdit'
+$qe = $null; $threw = $false
+try { $qe = Set-ConsoleQuickEdit $false } catch { $threw = $true }
+Assert (-not $threw) 'Set-ConsoleQuickEdit never throws (here: no interactive console)'
+if ($null -ne $qe) { $null = Set-ConsoleQuickEdit $true $qe }
+
 if ($failures -gt 0) { Write-Host "`n$failures check(s) failed." -ForegroundColor Red; exit 1 }
 Write-Host "`nAll patch helper checks passed." -ForegroundColor Green

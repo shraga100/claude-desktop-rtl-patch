@@ -4100,7 +4100,45 @@ function Show-Menu {
     else { Show-Menu }
 }
 
+# QuickEdit: in the classic console, one click in the window starts a selection
+# ("Select" in the title), and while it is active every console write blocks -- the
+# whole script freezes on its next Write-Host. An auto re-patch window pops up on its
+# own, so a click to focus it could stall the patch with Claude already closed. Auto
+# mode turns QuickEdit off while patching and restores the user's mode for the final
+# prompt, so the log can still be selected and copied. Returns the previous mode
+# (or $null when there's no console to change). Never throws.
+function Set-ConsoleQuickEdit([bool]$Enable, $RestoreMode = $null) {
+    try {
+        if (-not ('RtlConsoleMode' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class RtlConsoleMode {
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr h, out uint mode);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr h, uint mode);
+}
+'@
+        }
+        $h = [RtlConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        [uint32]$mode = 0
+        if (-not [RtlConsoleMode]::GetConsoleMode($h, [ref]$mode)) { return $null }
+        if ($null -ne $RestoreMode) {
+            $new = [uint32]$RestoreMode
+        } elseif ($Enable) {
+            $new = $mode -bor 0x40 -bor 0x80        # ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS
+        } else {
+            $new = ($mode -band (-bnot [uint32]0x40)) -bor 0x80
+        }
+        $null = [RtlConsoleMode]::SetConsoleMode($h, [uint32]$new)
+        return $mode
+    } catch {
+        return $null
+    }
+}
+
 if ($Auto) {
+    $savedConsoleMode = Set-ConsoleQuickEdit $false
     Write-Host "`n=======================================================" -ForegroundColor Cyan
     Write-Host "  AUTO RE-PATCH MODE (triggered by Claude update)" -ForegroundColor Cyan
     Write-Host "=======================================================`n" -ForegroundColor Cyan
@@ -4115,6 +4153,7 @@ if ($Auto) {
         $exitCode = 1
     }
 
+    if ($null -ne $savedConsoleMode) { $null = Set-ConsoleQuickEdit $true $savedConsoleMode }
     Write-Host "`nPress Enter to close this window..." -ForegroundColor DarkGray
     $null = Read-Host
     Exit $exitCode
