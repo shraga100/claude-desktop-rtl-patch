@@ -149,6 +149,14 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 
 **Claude updated and the patch broke:** Run the "Update Claude RTL" shortcut, or use the auto-updater. To fix it manually, delete any `.bak` files in the Claude app directory and run the installer again.
 
+**Claude vanished after an update and won't reopen until you end it in Task Manager:** Claude's updater installs the new version in the background, but Windows only switches to it once the old version exits. Sometimes a process from the old version stays behind with no window, and every new launch hands off to it and quits. End just the desktop app (a Claude Code CLI running in a terminal is left alone) and start Claude again; with the auto-updater (option 4) the patch is then re-applied on that launch:
+
+```powershell
+Get-Process claude | Where-Object Path -like '*\WindowsApps\*' | Stop-Process -Force
+```
+
+If no Claude process is left and it still won't open, sign out of Windows and back in, or restart. In that case Windows is holding the app in a stuck state rather than a process, so there is nothing to end.
+
 **`Import-Module … The member AuditToString is already present`:** You ran the command in **PowerShell 7 (`pwsh`)**, which has a known bug that breaks the patch. Use the built-in **Windows PowerShell** instead:
 
 1. Press **Win + R**, type `powershell`, and press **Enter**. This opens the classic **blue** Windows PowerShell window (not the black `pwsh` one).

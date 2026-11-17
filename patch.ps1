@@ -2939,6 +2939,11 @@ function Create-UpdateShortcut {
 # claude.exe versions; when it fires it fetches patch.ps1 LIVE and runs THAT.
 # -----------------------------------------------------------------------------
 function Save-WatcherScript {
+    # -OnlyIfChanged: used by auto re-patches to roll a newer watcher body out to
+    # existing installs without re-registering the task. A running watcher read its
+    # script at start and holds no handle on it; it picks the new body up at its next
+    # start (logon). Skips the write when the file already matches.
+    param([switch]$OnlyIfChanged)
     try {
         if (-not (Protect-RtlStateDir)) {
             Write-Warn "State dir could not be secured; refusing to write the auto-update watcher."
@@ -3126,7 +3131,13 @@ function Invoke-AutoPatch($newVer, $exePath) {
     $watcherIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($watcherIsAdmin) {
         Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
-        Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        # claude.exe is also the Claude Code CLI: end only the desktop app (MSIX folder)
+        # and the CLI copies it runs (...\claude-code\...), same filter as
+        # Stop-ClaudeServices. A standalone CLI in a terminal is left alone.
+        Get-Process -Name claude -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.Path -or $_.Path -match '\\WindowsApps\\|\\claude-code\\' } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process -Name cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     } else {
         Show-Toast "Claude updated to v$newVer" "The RTL patch needs re-applying. Please approve the admin (UAC) prompt."
     }
@@ -3168,7 +3179,10 @@ Write-WLog "Currently patched version: $(Get-PatchedVer)"
 
 # Initial sweep -- Claude may already be running a newer version at watcher start.
 try {
-    $existing = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+    # Desktop app only: a Claude Code copy (...\claude-code\...) has no version in its
+    # path, so picking one first would skip a pending update.
+    $existing = Get-Process -Name claude -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -match '\\WindowsApps\\' } | Select-Object -First 1
     if ($existing) { Test-AndPatch $existing.Path }
 } catch {}
 
@@ -3189,6 +3203,15 @@ while ($true) {
     }
 }
 '@
+
+        if ($OnlyIfChanged -and (Test-Path -LiteralPath $watcherPath)) {
+            $current = $null
+            try { $current = [System.IO.File]::ReadAllText($watcherPath, [System.Text.Encoding]::UTF8) } catch { }
+            if ($current -ceq $watcherBody) {
+                Write-Log "Watcher script is up to date."
+                return
+            }
+        }
 
         # PS 5.1 needs UTF-8 with BOM to parse Unicode text (Hebrew + toast XML) correctly.
         Remove-PlantedFile $watcherPath
@@ -3834,6 +3857,10 @@ function Install-PatchCore {
                 if ($existingTask -and $needsUpgrade) {
                     Write-Log "Detected legacy/encoded watcher -- upgrading to on-disk watcher.ps1 silently."
                     Install-AutoUpdateTask
+                } elseif ($existingTask) {
+                    # Task is current: refresh only the script body (no re-register, so the
+                    # running watcher and the patch it spawned are left untouched).
+                    Save-WatcherScript -OnlyIfChanged
                 }
             } catch {
                 Write-Warn "Watcher upgrade check failed: $($_.Exception.Message)"

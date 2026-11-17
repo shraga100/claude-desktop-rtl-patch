@@ -149,6 +149,14 @@ irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/in
 
 **אם Claude התעדכן והפאצ' הפסיק לעבוד:** הריצו את קיצור **Update Claude RTL**, או השתמשו בעדכון האוטומטי. לתיקון ידני, מחקו את קבצי ה-`.bak` מתיקיית האפליקציה של Claude והריצו שוב את המתקין.
 
+**אם Claude נעלם אחרי עדכון ולא נפתח שוב עד שסוגרים אותו במנהל המשימות:** ה-updater של Claude מתקין את הגרסה החדשה ברקע, אבל Windows עובר אליה רק אחרי שהגרסה הישנה נסגרת. לפעמים נשאר תהליך של הגרסה הישנה ברקע בלי חלון, וכל הפעלה חדשה מעבירה אליו את השליטה ונסגרת מיד. סגרו רק את אפליקציית הדסקטופ (Claude Code CLI שרץ בטרמינל לא ייסגר) והפעילו את Claude שוב. אם העדכון האוטומטי (אפשרות 4) מופעל, הפאצ' יוחל מחדש בהפעלה הזו:
+
+```powershell
+Get-Process claude | Where-Object Path -like '*\WindowsApps\*' | Stop-Process -Force
+```
+
+אם לא נשאר אף תהליך של Claude והוא עדיין לא נפתח, התנתקו מ-Windows והתחברו שוב, או הפעילו מחדש את המחשב. במקרה כזה Windows מחזיק את האפליקציה במצב תקוע ולא בתהליך, כך שאין מה לסגור.
+
 **מופיעה השגיאה `Import-Module … The member AuditToString is already present`:** הרצתם את הפקודה ב-**PowerShell 7 (`pwsh`)**, שיש בו באג ידוע ששובר את הפאצ'. השתמשו במקום זאת ב-**Windows PowerShell** המובנה:
 
 1. הקישו **Win + R**, הקלידו `powershell` והקישו **Enter**. זה פותח את חלון Windows PowerShell ה**כחול** הקלאסי (לא את ה-`pwsh` השחור).
