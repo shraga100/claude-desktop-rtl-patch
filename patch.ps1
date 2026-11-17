@@ -2570,7 +2570,18 @@ function Remove-StaleRtlCerts {
             $removed = 0
             foreach ($old in $stale) {
                 try {
-                    $null = Remove-CertPrivateKey -Cert $old
+                    # Old entries usually keep only a dangling key link (the key was wiped
+                    # at patch time): HasPrivateKey stays True but the key can't be opened.
+                    # Remove-CertPrivateKey can do nothing with those except log a failure
+                    # per cert, so call it only when a key can actually be opened.
+                    $usableKey = $false
+                    if ($old.HasPrivateKey) {
+                        try { if ([System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($old)) { $usableKey = $true } } catch {}
+                        if (-not $usableKey) {
+                            try { if ([System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($old)) { $usableKey = $true } } catch {}
+                        }
+                    }
+                    if ($usableKey) { $null = Remove-CertPrivateKey -Cert $old }
                     $st.Remove($old)
                     $removed++
                 } catch {
