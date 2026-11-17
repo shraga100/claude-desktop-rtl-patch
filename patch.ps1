@@ -1829,8 +1829,122 @@ function Save-PatchState {
         Remove-PlantedFile $global:RtlStateFile
         $state | ConvertTo-Json | Set-Content -Path $global:RtlStateFile -Encoding UTF8
         Write-Log "Patch state recorded at $global:RtlStateFile (version: $($state.patchedVersion))"
+        Clear-AutoPatchFailure
     } catch {
         Write-Warn "Failed to save patch state: $($_.Exception.Message)"
+    }
+}
+
+# --- Auto re-patch backoff (#48) ---------------------------------------------------
+# A failed auto re-patch leaves state.json on the old version, and the rollback
+# relaunches Claude, so the watcher re-fires on the next claude.exe start: Claude was
+# killed and re-patched every ~90 s, forever. Installed watchers can't be changed
+# from here (watcher.ps1 is only rewritten when the task is installed), but they all
+# skip a run while last-action.txt is less than 90 s old -- and a FUTURE timestamp
+# reads as negative age, so writing one pauses them until then, with no watcher change.
+
+# Pause after the Nth consecutive failure for the same Claude version. The first
+# failure keeps the normal 90 s throttle so a transient error (a locked file) gets a
+# quick second try.
+function Get-AutoPatchPause([int]$Count) {
+    if ($Count -le 1) { return [TimeSpan]::Zero }
+    if ($Count -eq 2) { return [TimeSpan]::FromHours(1) }
+    if ($Count -eq 3) { return [TimeSpan]::FromHours(6) }
+    return [TimeSpan]::FromHours(24)
+}
+
+function Get-AutoPatchFailureFile { return (Join-Path $global:RtlStateDir 'auto-failures.json') }
+
+# Every last-action.txt an installed watcher may read: the ProgramData one, and the
+# per-user fallback an unelevated watcher uses (#34) -- only if it already exists.
+function Get-WatcherThrottleFiles {
+    $files = @(Join-Path $global:RtlStateDir 'last-action.txt')
+    if ($env:LOCALAPPDATA) {
+        $userFile = Join-Path (Join-Path $env:LOCALAPPDATA 'ClaudeRtlPatch') 'last-action.txt'
+        if (Test-Path -LiteralPath $userFile) { $files += $userFile }
+    }
+    return $files
+}
+
+function Register-AutoPatchFailure([string]$Reason) {
+    if (-not $Auto) { return }
+    if ($script:AutoFailureRecorded) { return }
+    $script:AutoFailureRecorded = $true
+    # A concurrent run holding the install mutex is not a failure of the patch.
+    if ($Reason -like 'Another Claude RTL patch run is already in progress*') { return }
+    try {
+        if (-not (Protect-RtlStateDir)) {
+            Write-Warn "State dir could not be secured; auto re-patch failure not recorded."
+            return
+        }
+        $ver = $null
+        try { $ver = Get-ClaudeVersionFromPath -Path (Find-ClaudeDir) } catch { }
+        $verStr = if ($ver) { $ver.ToString() } else { 'unknown' }
+
+        $failFile = Get-AutoPatchFailureFile
+        $count = 1
+        if (Test-Path -LiteralPath $failFile) {
+            try {
+                $prev = Get-Content -LiteralPath $failFile -Raw | ConvertFrom-Json
+                if ($prev.version -eq $verStr -and $prev.count) { $count = [int]$prev.count + 1 }
+            } catch { }
+        }
+
+        $pause = Get-AutoPatchPause $count
+        $until = if ($pause -gt [TimeSpan]::Zero) { (Get-Date).Add($pause) } else { $null }
+        $msg = if ($Reason) { $Reason } else { '' }
+        if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
+        $record = [ordered]@{
+            version      = $verStr
+            count        = $count
+            lastError    = $msg
+            lastFailedAt = (Get-Date).ToUniversalTime().ToString('o')
+            pausedUntil  = if ($until) { $until.ToUniversalTime().ToString('o') } else { $null }
+        }
+        Remove-PlantedFile $failFile
+        $record | ConvertTo-Json | Set-Content -Path $failFile -Encoding UTF8
+
+        Write-Warn "Auto re-patch failed $count time(s) in a row for Claude v$verStr."
+        if ($until) {
+            foreach ($f in Get-WatcherThrottleFiles) {
+                try {
+                    if ($f.StartsWith($global:RtlStateDir, [StringComparison]::OrdinalIgnoreCase)) { Remove-PlantedFile $f }
+                    $until.ToString('o') | Set-Content -Path $f -Encoding UTF8
+                } catch {
+                    Write-Warn "Could not write the watcher pause to ${f}: $($_.Exception.Message)"
+                }
+            }
+            Write-Warn "Auto re-patch is paused until $($until.ToString('yyyy-MM-dd HH:mm')) so Claude isn't closed again and again."
+        } else {
+            Write-Warn "The watcher will retry once on the next Claude launch; repeated failures pause it (1h, 6h, then 24h)."
+        }
+        Write-Warn "To retry now: run patch.ps1 and choose option 1."
+    } catch {
+        Write-Warn "Could not record the auto re-patch failure: $($_.Exception.Message)"
+    }
+}
+
+# After a successful patch (manual or auto): forget past failures and lift any pause.
+function Clear-AutoPatchFailure {
+    try {
+        $failFile = Get-AutoPatchFailureFile
+        if (Test-Path -LiteralPath $failFile) {
+            Remove-Item -LiteralPath $failFile -Force -ErrorAction Stop
+            Write-Log "Cleared the auto re-patch failure record."
+        }
+        foreach ($f in Get-WatcherThrottleFiles) {
+            if (-not (Test-Path -LiteralPath $f)) { continue }
+            try {
+                $t = [DateTime]::Parse((Get-Content -LiteralPath $f -Raw).Trim())
+                if ($t -gt (Get-Date)) {
+                    if ($f.StartsWith($global:RtlStateDir, [StringComparison]::OrdinalIgnoreCase)) { Remove-PlantedFile $f }
+                    (Get-Date).ToString('o') | Set-Content -Path $f -Encoding UTF8
+                    Write-Log "Lifted the auto re-patch pause ($f)."
+                }
+            } catch { }
+        }
+    } catch {
+        Write-Warn "Could not clear the auto re-patch failure record: $($_.Exception.Message)"
     }
 }
 
@@ -3739,6 +3853,10 @@ function Install-PatchCore {
         } catch { Write-Warn "Could not remove $($TmpAsarPath): $($_.Exception.Message)" }
         Remove-PatchWorkspaces
 
+        # Record the failure (auto mode only) BEFORE the rollback relaunches Claude,
+        # so the watcher is already paused when that launch fires it again.
+        Register-AutoPatchFailure $ErrorMessage
+
         Restore-Patch -IsRollback
 
         # Don't claim a successful restore -- Restore-Patch may have aborted and prints
@@ -3964,6 +4082,9 @@ if ($Auto) {
         Install-Patch
     } catch {
         Write-Host "`n[!] Auto patch failed: $($_.Exception.Message)" -ForegroundColor Red
+        # Failures before the transaction (preflight, backups, ownership) land here;
+        # one already recorded inside the transaction is not counted twice.
+        Register-AutoPatchFailure $_.Exception.Message
         $exitCode = 1
     }
 

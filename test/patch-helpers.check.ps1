@@ -155,5 +155,120 @@ $callIdx = $patchText.IndexOf('Remove-StaleRtlCerts -KeepThumbprint $Cert.Thumbp
 $signIdx = $patchText.IndexOf('Successfully re-signed cowork-svc.exe')
 Assert ($callIdx -gt $signIdx -and $signIdx -gt 0) 'the sweep is called only after cowork-svc.exe is re-signed'
 
+# --- Auto re-patch backoff (#48) -------------------------------------------------
+Write-Host "`nAuto re-patch backoff"
+foreach ($n in 'Get-AutoPatchPause', 'Get-AutoPatchFailureFile', 'Get-WatcherThrottleFiles',
+               'Register-AutoPatchFailure', 'Clear-AutoPatchFailure', 'Remove-PlantedFile', 'Get-ClaudeVersionFromPath') {
+    Import-PatchFunction $n
+}
+$pauses = @(1, 2, 3, 4, 9) | ForEach-Object { (Get-AutoPatchPause $_).TotalHours }
+Assert (($pauses -join ',') -eq '0,1,6,24,24') "pause table is 0/1h/6h/24h/24h (got $($pauses -join ','))"
+
+$tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ("rtl-backoff-" + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $tmpRoot
+$savedStateDir = $global:RtlStateDir; $savedLocal = $env:LOCALAPPDATA
+try {
+    $global:RtlStateDir = Join-Path $tmpRoot 'ProgramData'
+    $null = New-Item -ItemType Directory -Path $global:RtlStateDir
+    $env:LOCALAPPDATA = Join-Path $tmpRoot 'LocalAppData'
+    $userDir = Join-Path $env:LOCALAPPDATA 'ClaudeRtlPatch'
+    $null = New-Item -ItemType Directory -Path $userDir -Force
+    $userThrottle = Join-Path $userDir 'last-action.txt'
+    (Get-Date).AddMinutes(-5).ToString('o') | Set-Content $userThrottle -Encoding UTF8
+    $pdThrottle = Join-Path $global:RtlStateDir 'last-action.txt'
+    $failFile = Join-Path $global:RtlStateDir 'auto-failures.json'
+
+    function Protect-RtlStateDir { $true }
+    $script:FakeClaudeDir = 'C:\Program Files\WindowsApps\Claude_5.11492.5.0_x64__pzs8sxrjxfjjc'
+    function Find-ClaudeDir { $script:FakeClaudeDir }
+    function Read-Fail { Get-Content -LiteralPath $failFile -Raw | ConvertFrom-Json }
+    function Read-Time($f) { [DateTime]::Parse((Get-Content -LiteralPath $f -Raw).Trim()) }
+    function Invoke-Failure($reason) { $script:AutoFailureRecorded = $false; Register-AutoPatchFailure $reason }
+
+    $Auto = $false
+    Invoke-Failure 'boom'
+    Assert (-not (Test-Path $failFile)) 'manual (non-auto) runs record nothing'
+
+    $Auto = $true
+    Invoke-Failure 'Another Claude RTL patch run is already in progress. Wait for it to finish, then try again.'
+    Assert (-not (Test-Path $failFile)) 'a busy install mutex is not counted as a failure'
+
+    Invoke-Failure 'Re-signing cowork-svc.exe failed: UnknownError'
+    $r = Read-Fail
+    Assert ($r.count -eq 1 -and $r.version -eq '5.11492.5.0') 'first failure: count 1 for the installed version'
+    Assert ($null -eq $r.pausedUntil -and -not (Test-Path $pdThrottle)) 'first failure: no pause written (normal 90 s throttle)'
+
+    Register-AutoPatchFailure 'second call in the same run'
+    Assert ((Read-Fail).count -eq 1) 'a second call in the same run is not counted again'
+
+    Invoke-Failure 'again'
+    $r = Read-Fail
+    $pd = Read-Time $pdThrottle
+    Assert ($r.count -eq 2) 'second failure: count 2'
+    Assert ($pd -gt (Get-Date).AddMinutes(55) -and $pd -lt (Get-Date).AddMinutes(65)) 'second failure: ProgramData last-action.txt set ~1h ahead'
+    Assert ((Read-Time $userThrottle) -gt (Get-Date).AddMinutes(55)) 'second failure: per-user last-action.txt (unelevated watcher) paused too'
+
+    Invoke-Failure 'again'; Invoke-Failure 'again'
+    $r = Read-Fail
+    Assert ($r.count -eq 4 -and (Read-Time $pdThrottle) -gt (Get-Date).AddHours(23)) 'fourth failure: count 4, paused ~24h'
+
+    $script:FakeClaudeDir = 'C:\Program Files\WindowsApps\Claude_5.12000.0.0_x64__pzs8sxrjxfjjc'
+    Invoke-Failure 'new version'
+    Assert ((Read-Fail).count -eq 1 -and (Read-Fail).version -eq '5.12000.0.0') 'a different Claude version restarts the count'
+
+    Invoke-Failure ('x' * 1000)
+    Assert ((Read-Fail).lastError.Length -eq 300) 'lastError is capped at 300 chars'
+
+    (Get-Date).AddHours(10).ToString('o') | Set-Content $pdThrottle -Encoding UTF8
+    (Get-Date).AddHours(10).ToString('o') | Set-Content $userThrottle -Encoding UTF8
+    Clear-AutoPatchFailure
+    Assert (-not (Test-Path $failFile)) 'success clears the failure record'
+    Assert ((Read-Time $pdThrottle) -le (Get-Date) -and (Read-Time $userThrottle) -le (Get-Date)) 'success lifts a future pause in both throttle files'
+
+    # --- the watcher's own Invoke-AutoPatch honours a future last-action.txt --------
+    Write-Host "`nWatcher compatibility"
+    function Test-WatcherThrottle([string]$watcherText, [string]$label) {
+        $wAst = [System.Management.Automation.Language.Parser]::ParseInput($watcherText, [ref]$null, [ref]$null)
+        $fn = $wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-AutoPatch' }, $true)
+        if (-not $fn) { Assert $false "${label}: Invoke-AutoPatch found"; return }
+        . ([ScriptBlock]::Create($fn.Extent.Text))
+        $script:WLog = @(); $script:PinnedCalled = $false
+        function Write-WLog($m) { $script:WLog += $m }
+        function Show-Toast($a, $b) { }
+        function Get-PinnedRsa { $script:PinnedCalled = $true; return $null }
+        $lastActionFile = Join-Path $tmpRoot 'watcher-last-action.txt'
+
+        $future = (Get-Date).AddHours(6).ToString('o')
+        $future | Set-Content $lastActionFile -Encoding UTF8
+        Invoke-AutoPatch -newVer '9.9.9.9' -exePath 'C:\x\claude.exe'
+        Assert (-not $script:PinnedCalled -and @($script:WLog | Where-Object { $_ -like 'Throttled*' }).Count -eq 1) "${label}: future last-action.txt -> throttled, nothing downloaded or killed"
+        Assert ((Get-Content $lastActionFile -Raw).Trim() -eq $future) "${label}: the pause is not overwritten by a throttled run"
+
+        $script:WLog = @(); $script:PinnedCalled = $false
+        (Get-Date).AddHours(-2).ToString('o') | Set-Content $lastActionFile -Encoding UTF8
+        Invoke-AutoPatch -newVer '9.9.9.9' -exePath 'C:\x\claude.exe'
+        Assert ($script:PinnedCalled) "${label}: control -- an old last-action.txt does proceed"
+    }
+    $pt = [IO.File]::ReadAllText($patchPath)
+    $regIdx = $pt.IndexOf('Register-AutoPatchFailure $ErrorMessage')
+    $rbIdx  = $pt.IndexOf('Restore-Patch -IsRollback', [Math]::Max(0, $regIdx))
+    Assert ($regIdx -gt 0 -and $rbIdx -gt $regIdx -and ($rbIdx - $regIdx) -lt 400) 'failure is recorded right before the rollback relaunches Claude'
+    Assert ($pt -match '(?s)Install-Patch\s*\r?\n\s*\} catch \{.*?Register-AutoPatchFailure') 'auto-mode catch records pre-transaction failures'
+    Assert ($pt -match '(?s)Patch state recorded at.*?Clear-AutoPatchFailure') 'a recorded patch state clears the failure record'
+
+    $wm = [regex]::Match([IO.File]::ReadAllText($patchPath), "(?s)\`$watcherBody = @'\r?\n(.*?)\r?\n'@")
+    Assert $wm.Success 'watcher body found in patch.ps1'
+    if ($wm.Success) { Test-WatcherThrottle $wm.Groups[1].Value 'watcher in patch.ps1' }
+    $installed = Join-Path $env:ProgramData 'ClaudeRtlPatch\watcher.ps1'
+    if ($savedLocal -and (Test-Path -LiteralPath $installed)) {
+        Test-WatcherThrottle ([IO.File]::ReadAllText($installed)) 'installed watcher.ps1'
+    } else {
+        Write-Host "  [SKIP] no installed watcher.ps1"
+    }
+} finally {
+    $global:RtlStateDir = $savedStateDir; $env:LOCALAPPDATA = $savedLocal
+    Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($failures -gt 0) { Write-Host "`n$failures check(s) failed." -ForegroundColor Red; exit 1 }
 Write-Host "`nAll patch helper checks passed." -ForegroundColor Green
