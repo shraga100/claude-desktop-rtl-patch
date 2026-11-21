@@ -82,7 +82,8 @@ When you run the script, you get an interactive menu:
 | **4** | Enable Auto Re-Patch | Installs a background watcher that re-patches after each Claude update |
 | **5** | Disable Auto Re-Patch | Removes that background watcher |
 | **6** | Set a Custom Text Font | Renders all text — or only Hebrew, or only Arabic/Persian — in an installed font of your choice |
-| **7** | Exit | Close the patcher |
+| **7** | Translate Claude | Translates the interface (or the whole conversation too) like the browser's "Translate this page" |
+| **8** | Exit | Close the patcher |
 
 ---
 
@@ -132,6 +133,46 @@ Prefer reading in a different typeface? The patch can render Claude's text in an
 - **Persistent:** the choice is saved (in `ProgramData\ClaudeRtlPatch`) and survives auto re-patches after Claude updates — set it once and forget it.
 - **Disable:** menu option 6 → type `none` (or `.\patch.ps1 -CustomFont none`), then re-apply the patch.
 - Any family name of letters/digits/spaces/hyphens works, e.g. `"Noto Naskh Arabic"`.
+
+---
+
+## 🌐 Optional: translate Claude
+
+Want Claude Desktop in a language it doesn't speak natively, or every reply translated for you? The patch can translate the page the way the browser's **Translate this page** does, and you choose how far it goes:
+
+| Scope | What gets translated |
+| :--- | :--- |
+| **Interface only** (default) | Menus, buttons, settings, tooltips, placeholders. The conversation stays exactly as written. |
+| **Interface and conversation** | Everything above, plus your messages and Claude's replies. |
+
+### Turn it on
+
+Run the patcher and choose **7. Translate Claude**, type a target language code (`he`, `ar`, `ru`, `fr`, `pt-BR`, `zh-CN`, ...), pick the scope, and answer **Y** to apply the patch. For scripting:
+
+```powershell
+.\patch.ps1 -TranslateTo he -TranslateScope ui     # ui | all
+.\patch.ps1 -TranslateTo none                      # turn it off
+```
+
+The choice is saved (in `ProgramData\ClaudeRtlPatch`) and survives auto re-patches after Claude updates. Inside Claude, **Ctrl+Alt+Shift+T** switches translation on/off (the original text comes back instantly) and **Ctrl+Alt+Shift+Y** flips between *interface only* and *everything*; the choice is remembered.
+
+> [!WARNING]
+> **Privacy:** the text is sent to Google Translate. With the *interface and conversation* scope that includes your messages and Claude's replies. Leave translation off (the default) if that is not acceptable.
+
+### Built to be cheap
+
+- **Text is edited in place.** No element is added, moved or removed, so Claude's React UI keeps working. Whole-page translators that rewrite the DOM are what usually break web apps.
+- **One request unit per paragraph/button, not per fragment.** Inline formatting (bold, links) travels as numbered markers, so the engine sees whole sentences and each piece is written back to its own text node. Inline code is sent as "do not translate".
+- **Only what you can see (plus a screenful around it)** is sent. Long histories and hidden panels cost nothing until you scroll to them.
+- **Batched and cached.** Many blocks per request, identical strings sent once, results (including "already in your language") cached in memory and `localStorage` with LRU eviction, so a known string never costs a second request and reopening Claude is instant.
+- **Streaming-aware.** A reply is translated paragraph by paragraph once a paragraph stops changing, not on every token.
+- **Skips what needs no translation:** text already in the target script (e.g. Hebrew when translating to Hebrew), numbers, URLs, e-mails, file paths, code blocks, math, and the message box you type in.
+- **Failure-friendly:** limited concurrency, exponential backoff, and a per-string retry cap.
+- **Zero cost when off:** the translation code is only injected when a language is configured.
+
+### How it works
+
+Claude's page security policy blocks calls to third-party hosts, so the renderer cannot reach the translation service itself. Rather than relaxing the policy or patching Claude's preload script, the renderer logs a tagged message to the console. A small hook in the main-process payload ([`src/main-payload.js`](src/main-payload.js)) picks it up, performs the request with Chromium's network stack (proxy- and certificate-aware), and answers through `window.__rtlTrResult`. The hook only talks to one fixed endpoint, validates the language code and request size, and is not installed at all when translation is off. The renderer side lives in [`src/translate.js`](src/translate.js).
 
 ---
 
